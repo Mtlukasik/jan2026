@@ -80,6 +80,24 @@ class MFVIConfig:
 
 
 @dataclass
+class SVGDConfig:
+    """Configuration for Stein Variational Gradient Descent inference.
+    
+    SVGD maintains an ensemble of particles that approximate the posterior.
+    Based on Liu & Wang (2016) "Stein Variational Gradient Descent".
+    """
+    n_particles: int = 20  # Number of particles in ensemble
+    svgd_lr: float = 1e-3  # Learning rate for SVGD updates
+    feature_lr: float = 1e-3  # Learning rate for feature extractor
+    prior_std: float = 1.0  # Prior standard deviation
+    bandwidth_scale: float = 1.0  # Kernel bandwidth scaling factor
+    num_epochs: int = 200  # Total training epochs
+    use_laplace_prior: bool = True  # Use Laplace prior (vs Gaussian)
+    weight_decay: float = 5e-4  # Weight decay for feature optimizer
+    grad_clip: float = 1.0  # Gradient clipping norm
+
+
+@dataclass
 class TemperatureConfig:
     """Temperature settings for cold/warm posterior experiments.
     
@@ -134,12 +152,13 @@ class ExperimentConfig:
     network: NetworkConfig = field(default_factory=NetworkConfig)
     mcmc: MCMCConfig = field(default_factory=MCMCConfig)
     mfvi: MFVIConfig = field(default_factory=MFVIConfig)
+    svgd: SVGDConfig = field(default_factory=SVGDConfig)
     temperature: TemperatureConfig = field(default_factory=TemperatureConfig)
     ood: OODConfig = field(default_factory=OODConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     
     # Experiment settings
-    num_replicates: int = 5  # Number of independent runs
+    num_replicates: int = 3  # Number of independent runs for statistics
     save_dir: str = "./results"
     seed: int = SEED
 

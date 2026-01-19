@@ -1,7 +1,7 @@
 """
-Main Script for MCMC vs MFVI Last Layer Bayesian Inference Comparison.
+Main Script for SVGD vs MFVI Last Layer Bayesian Inference Comparison.
 
-This script runs the complete experiment comparing MCMC and MFVI for
+This script runs the complete experiment comparing SVGD and MFVI for
 last-layer Bayesian inference on CIFAR-10, following the methodology
 in "Bayesian Neural Network Priors Revisited" (Fortuin et al., ICLR 2022).
 
@@ -15,13 +15,13 @@ Experiment Summary:
 ------------------
 1. Network: 2-layer FCNN with BatchNorm and Dropout
 2. Dataset: CIFAR-10 (in-distribution), SVHN (OOD)
-3. Methods: MCMC (SG-MCMC) vs MFVI (Mean-Field VI) for last layer
+3. Methods: SVGD (Stein Variational Gradient Descent) vs MFVI (Mean-Field VI) for last layer
 4. Temperatures: 0.001, 0.01, 0.03, 0.1, 0.3, 1.0
 5. Metrics: Error, NLL, ECE, OOD AUROC
-6. Replicates: 5 per configuration
+6. Replicates: 3 per configuration for statistics
 
 Key Findings Expected (based on paper):
-- MFVI generally performs worse than MCMC
+- MFVI generally performs worse than SVGD
 - Cold posteriors (T < 1) often improve performance
 - The choice of prior affects the cold posterior effect
 """
@@ -37,7 +37,7 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
-    ExperimentConfig, DataConfig, NetworkConfig, MCMCConfig, 
+    ExperimentConfig, DataConfig, NetworkConfig, SVGDConfig, 
     MFVIConfig, TemperatureConfig, OODConfig, CalibrationConfig,
     DEVICE, SEED
 )
@@ -49,28 +49,30 @@ from visualization import (
 
 
 def run_full_experiment(
-    num_replicates: int = 5,
-    pretrain_epochs: int = 100,
+    num_replicates: int = 3,
+    pretrain_epochs: int = 50,
     mfvi_epochs: int = 500,
+    svgd_epochs: int = 200,
     save_dir: str = "./results"
 ):
-    """Run the complete MCMC vs MFVI comparison experiment.
+    """Run the complete SVGD vs MFVI comparison experiment.
     
     This follows the paper's methodology:
     1. For each temperature and method:
        a. Train feature extractor with SGD
        b. Apply Bayesian inference to last layer
        c. Evaluate on all four metrics
-    2. Aggregate results across replicates
+    2. Aggregate results across 3 replicates for mean ± std
     3. Generate comparison figures
     """
     print("="*70)
-    print("MCMC vs MFVI Last Layer Comparison on CIFAR-10")
+    print("SVGD vs MFVI Last Layer Comparison on CIFAR-10")
     print("="*70)
     print(f"Device: {DEVICE}")
     print(f"Replicates: {num_replicates}")
     print(f"Pretrain epochs: {pretrain_epochs}")
     print(f"MFVI epochs: {mfvi_epochs}")
+    print(f"SVGD epochs: {svgd_epochs}")
     print("="*70)
     
     # Full configuration
@@ -81,11 +83,12 @@ def run_full_experiment(
             dropout_rate=0.2,
             use_batch_norm=True
         ),
-        mcmc=MCMCConfig(
-            num_cycles=60,
-            epochs_per_cycle=45,
-            samples_per_cycle=5,
-            burn_in_samples=50
+        svgd=SVGDConfig(
+            n_particles=20,
+            num_epochs=svgd_epochs,
+            svgd_lr=1e-3,
+            feature_lr=1e-3,
+            use_laplace_prior=True
         ),
         mfvi=MFVIConfig(
             num_epochs=mfvi_epochs,
@@ -104,9 +107,10 @@ def run_full_experiment(
     # Run all experiments
     print("\nRunning experiments...")
     results = runner.run_all_experiments(
-        methods=["mcmc", "mfvi"],
+        methods=["svgd", "mfvi"],
         pretrain_epochs=pretrain_epochs,
-        mfvi_epochs=mfvi_epochs
+        mfvi_epochs=mfvi_epochs,
+        svgd_epochs=svgd_epochs
     )
     
     # Save raw results
@@ -119,8 +123,8 @@ def run_full_experiment(
     # Convert to plotting format
     plot_data = convert_aggregated_results_to_plot_format(aggregated)
     
-    # Separate MCMC and MFVI data for plotting
-    mcmc_data = plot_data.get("mcmc", {})
+    # Separate SVGD and MFVI data for plotting
+    svgd_data = plot_data.get("svgd", {})
     mfvi_data = plot_data.get("mfvi", {})
     
     # Generate figures
@@ -128,17 +132,17 @@ def run_full_experiment(
     plotter = ResultsPlotter()
     
     fig = plotter.plot_comparison_grid(
-        mcmc_data, mfvi_data,
-        title="MCMC vs MFVI Last Layer Inference on CIFAR-10",
+        svgd_data, mfvi_data,
+        title="SVGD vs MFVI Last Layer Inference on CIFAR-10",
         save_path=os.path.join(save_dir, "figures", "comparison.png")
     )
     
     # Print summary
     print("\n" + "="*70)
-    print("EXPERIMENT SUMMARY")
+    print("EXPERIMENT SUMMARY (mean ± std over 3 replicates)")
     print("="*70)
     
-    for method in ["mcmc", "mfvi"]:
+    for method in ["svgd", "mfvi"]:
         print(f"\n{method.upper()} Results:")
         print("-" * 40)
         method_results = [a for a in aggregated if a.method == method]
@@ -167,7 +171,7 @@ def run_unit_tests():
         ("data_loading", "data_loading"),
         ("networks", "networks"),
         ("metrics", "metrics"),
-        ("mcmc_inference", "mcmc_inference"),
+        ("svgd_inference", "svgd_inference"),
         ("mfvi_inference", "mfvi_inference"),
         ("experiment_runner", "experiment_runner"),
         ("visualization", "visualization"),
