@@ -66,7 +66,7 @@ class MFVIConfig:
     
     Based on Blundell et al. (2015) and the paper's appendix A.11.
     """
-    num_epochs: int = 1000
+    num_epochs: int = 200
     batch_size: int = 500
     learning_rate_init: float = 0.01
     learning_rate_decay: float = 0.001  # After 500 epochs
@@ -86,7 +86,7 @@ class SVGDConfig:
     SVGD maintains an ensemble of particles that approximate the posterior.
     Based on Liu & Wang (2016) "Stein Variational Gradient Descent".
     """
-    n_particles: int = 20  # Number of particles in ensemble
+    n_particles: int =  100  # Number of particles in ensemble
     svgd_lr: float = 1e-3  # Learning rate for SVGD updates
     feature_lr: float = 1e-3  # Learning rate for feature extractor
     prior_std: float = 1.0  # Prior standard deviation

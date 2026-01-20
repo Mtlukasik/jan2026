@@ -352,7 +352,7 @@ def main():
     parser.add_argument(
         "--replicates",
         type=int,
-        default=5,
+        default=3,
         help="Number of replicates for full experiment"
     )
     parser.add_argument(
