@@ -1,6 +1,6 @@
-# MCMC vs MFVI Last Layer Bayesian Inference Comparison
+# SVGD vs MFVI Last Layer Bayesian Inference Comparison
 
-This project implements a comparison of **MCMC (Stochastic Gradient MCMC)** and **MFVI (Mean-Field Variational Inference)** for last-layer Bayesian inference on CIFAR-10, following the methodology in:
+This project implements a comparison of **Stein Variational** and **MFVI (Mean-Field Variational Inference)** for last-layer Bayesian inference on CIFAR-10, following the methodology in:
 
 > **"Bayesian Neural Network Priors Revisited"**  
 > Vincent Fortuin*, Adrià Garriga-Alonso*, et al.  
