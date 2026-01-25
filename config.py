@@ -66,14 +66,14 @@ class MFVIConfig:
     
     Based on Blundell et al. (2015) and the paper's appendix A.11.
     """
-    num_epochs: int = 200
+    num_epochs: int = 350
     batch_size: int = 500
     learning_rate_init: float = 0.01
     learning_rate_decay: float = 0.001  # After 500 epochs
     # KL annealing for first 100 epochs
     kl_annealing_epochs: int = 100
     # Number of samples for training/testing
-    num_train_samples: int = 1
+    num_train_samples: int = 100
     num_test_samples: int = 10
     # Prior variance
     prior_log_var: float = 0.0  # log(1.0)
@@ -91,7 +91,7 @@ class SVGDConfig:
     feature_lr: float = 1e-3  # Learning rate for feature extractor
     prior_std: float = 1.0  # Prior standard deviation
     bandwidth_scale: float = 1.0  # Kernel bandwidth scaling factor
-    num_epochs: int = 200  # Total training epochs
+    num_epochs: int = 350  # Total training epochs
     use_laplace_prior: bool = True  # Use Laplace prior (vs Gaussian)
     weight_decay: float = 5e-4  # Weight decay for feature optimizer
     grad_clip: float = 1.0  # Gradient clipping norm

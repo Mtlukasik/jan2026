@@ -66,13 +66,13 @@ class FeatureExtractor(nn.Module):
         self.fc1 = nn.Linear(config.input_dim, config.hidden_dim)
         
         # Batch normalization
-        self.bn1 = nn.BatchNorm1d(config.hidden_dim) if config.use_batch_norm else nn.Identity()
+        #self.bn1 = nn.BatchNorm1d(config.hidden_dim) if config.use_batch_norm else nn.Identity()
         
         # Activation
         self.activation = get_activation(config.activation)
         
         # Dropout
-        self.dropout = nn.Dropout(config.dropout_rate)
+        #self.dropout = nn.Dropout(config.dropout_rate)
         
         # Initialize weights
         self._init_weights()
@@ -93,9 +93,9 @@ class FeatureExtractor(nn.Module):
             Features of shape (batch_size, hidden_dim)
         """
         x = self.fc1(x)
-        x = self.bn1(x)
+        #x = self.bn1(x)
         x = self.activation(x)
-        x = self.dropout(x)
+        #x = self.dropout(x)
         return x
 
 
