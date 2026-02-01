@@ -240,7 +240,7 @@ class DeterministicResNetTrainer:
         
         preds = all_probs.argmax(dim=-1)
         error = (preds != all_labels).float().mean().item()
-        nll = F.cross_entropy(torch.log(all_probs + 1e-10), all_labels).item()
+        nll = F.nll_loss(torch.log(all_probs + 1e-10), all_labels).item()
         
         # ECE
         confidences, predictions = all_probs.max(dim=-1)
@@ -710,7 +710,7 @@ class BayesianLastLayerTrainer:
         error = (all_probs.argmax(-1) != all_labels).float().mean().item()
         
         # NLL
-        nll = F.cross_entropy(torch.log(all_probs + 1e-10), all_labels).item()
+        nll = F.nll_loss(torch.log(all_probs + 1e-10), all_labels).item()
         
         # ECE
         conf, pred = all_probs.max(-1)
@@ -852,7 +852,7 @@ class BayesianLastLayerTrainer:
         all_labels = torch.cat(all_labels)
         
         error = (all_probs.argmax(-1) != all_labels).float().mean().item()
-        nll = F.cross_entropy(torch.log(all_probs + 1e-10), all_labels).item()
+        nll = F.nll_loss(torch.log(all_probs + 1e-10), all_labels).item()
         
         # ECE
         conf, pred = all_probs.max(-1)
@@ -1515,7 +1515,7 @@ class JointTrainer:
         ood_entropy = torch.cat(ood_entropy)
         
         error = (all_probs.argmax(-1) != all_labels).float().mean().item()
-        nll = F.cross_entropy(torch.log(all_probs + 1e-10), all_labels).item()
+        nll = F.nll_loss(torch.log(all_probs + 1e-10), all_labels).item()
         
         conf, pred = all_probs.max(-1)
         acc = (pred == all_labels).float()
@@ -1551,7 +1551,7 @@ class JointTrainer:
         all_labels = torch.cat(all_labels)
         
         error = (all_probs.argmax(-1) != all_labels).float().mean().item()
-        nll = F.cross_entropy(torch.log(all_probs + 1e-10), all_labels).item()
+        nll = F.nll_loss(torch.log(all_probs + 1e-10), all_labels).item()
         
         conf, pred = all_probs.max(-1)
         acc = (pred == all_labels).float()
