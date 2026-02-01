@@ -1,28 +1,52 @@
 """
-Configuration and constants for BNN comparison experiment.
+Configuration for SVGD vs MFVI Last-Layer Bayesian Inference Comparison.
 
 This module contains all hyperparameters and configuration settings
-for comparing MCMC vs MFVI last-layer Bayesian inference on CIFAR-10.
+for comparing SVGD vs MFVI last-layer Bayesian inference on CIFAR-10.
 
 Based on: "Bayesian Neural Network Priors Revisited" (Fortuin et al., ICLR 2022)
 """
 
 import torch
+import os
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
-# Device configuration
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Device configuration with better detection
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return torch.device("mps")  # Apple Silicon
+    else:
+        return torch.device("cpu")
+
+DEVICE = get_device()
+
+# Print device info
+print(f"Using device: {DEVICE}")
+if DEVICE.type == "cuda":
+    print(f"  GPU: {torch.cuda.get_device_name(0)}")
+    print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
 # Random seed for reproducibility
 SEED = 42
+
+# Auto-detect optimal num_workers
+def get_num_workers():
+    try:
+        cpu_count = os.cpu_count() or 2
+        # Use fewer workers to avoid issues
+        return min(2, cpu_count)
+    except:
+        return 0
 
 
 @dataclass
 class DataConfig:
     """Configuration for data loading and preprocessing."""
     batch_size: int = 128
-    num_workers: int = 4
+    num_workers: int = field(default_factory=get_num_workers)
     # CIFAR-10 statistics
     cifar10_mean: Tuple[float, float, float] = (0.4914, 0.4822, 0.4465)
     cifar10_std: Tuple[float, float, float] = (0.2470, 0.2435, 0.2616)
@@ -39,107 +63,58 @@ class NetworkConfig:
     output_dim: int = 10   # CIFAR-10 classes
     dropout_rate: float = 0.2
     use_batch_norm: bool = True
-    activation: str = "relu"  # Options: "relu", "tanh", "sigmoid"
+    activation: str = "relu"
 
-
-@dataclass 
-class MCMCConfig:
-    """Configuration for MCMC (SG-MCMC) inference on last layer.
-    
-    Based on the paper's approach using Gradient-Guided Monte Carlo (GG-MC)
-    with cyclical learning rate schedule.
-    """
-    num_cycles: int = 60  # Number of SG-MCMC cycles
-    epochs_per_cycle: int = 45
-    samples_per_cycle: int = 5  # Samples taken from last 5 epochs
-    burn_in_samples: int = 50  # Samples to discard
-    learning_rate_init: float = 0.01
-    # Only add Langevin noise in last 15 epochs of each cycle
-    noise_epochs: int = 15
-    # Number of chains for diagnostics
-    num_chains: int = 5
-    
 
 @dataclass
 class MFVIConfig:
-    """Configuration for Mean-Field Variational Inference on last layer.
-    
-    Based on Blundell et al. (2015) and the paper's appendix A.11.
-    """
-    num_epochs: int = 350
-    batch_size: int = 500
+    """Configuration for Mean-Field Variational Inference on last layer."""
+    num_epochs: int = 500
+    batch_size: int = 128
     learning_rate_init: float = 0.01
-    learning_rate_decay: float = 0.001  # After 500 epochs
-    # KL annealing for first 100 epochs
+    learning_rate_decay: float = 0.001
     kl_annealing_epochs: int = 100
-    # Number of samples for training/testing
-    num_train_samples: int = 100
+    num_train_samples: int = 1
     num_test_samples: int = 10
-    # Prior variance
-    prior_log_var: float = 0.0  # log(1.0)
+    prior_log_var: float = 0.0
 
 
 @dataclass
 class SVGDConfig:
-    """Configuration for Stein Variational Gradient Descent inference.
-    
-    SVGD maintains an ensemble of particles that approximate the posterior.
-    Based on Liu & Wang (2016) "Stein Variational Gradient Descent".
-    """
-    n_particles: int =  100  # Number of particles in ensemble
-    svgd_lr: float = 1e-3  # Learning rate for SVGD updates
-    feature_lr: float = 1e-3  # Learning rate for feature extractor
-    prior_std: float = 1.0  # Prior standard deviation
-    bandwidth_scale: float = 1.0  # Kernel bandwidth scaling factor
-    num_epochs: int = 350  # Total training epochs
+    """Configuration for Stein Variational Gradient Descent inference."""
+    n_particles: int = 20           # Number of particles in ensemble
+    svgd_lr: float = 1e-3           # Learning rate for SVGD updates
+    feature_lr: float = 1e-4        # Learning rate for feature extractor (Phase 2/Step 3)
+    prior_std: float = 1.0          # Prior standard deviation
+    bandwidth_scale: float = 1.0    # Kernel bandwidth scaling factor
+    num_epochs: int = 200           # Total training epochs (Phase 1/Step 2)
+    phase2_epochs: int = 50         # Joint training epochs (Phase 2/Step 3), 0 to skip
     use_laplace_prior: bool = True  # Use Laplace prior (vs Gaussian)
-    weight_decay: float = 5e-4  # Weight decay for feature optimizer
-    grad_clip: float = 1.0  # Gradient clipping norm
+    weight_decay: float = 5e-4      # Weight decay for feature optimizer (Phase 2)
+    grad_clip: float = 1.0          # Gradient clipping norm
+    init_std: float = 0.01          # Std for particle initialization perturbation
 
 
 @dataclass
 class TemperatureConfig:
-    """Temperature settings for cold/warm posterior experiments.
-    
-    The paper tests temperatures: 0.001, 0.01, 0.03, 0.1, 0.3, 1.0
-    and some experiments include T > 1 (warm posteriors).
-    """
+    """Temperature settings for cold/warm posterior experiments."""
     temperatures: List[float] = field(default_factory=lambda: [
         0.001, 0.01, 0.03, 0.1, 0.3, 1.0
-    ])
-    # Extended temperatures including warm posteriors
-    extended_temperatures: List[float] = field(default_factory=lambda: [
-        0.001, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0
     ])
 
 
 @dataclass
 class OODConfig:
-    """Configuration for Out-of-Distribution detection experiments.
-    
-    The paper uses different OOD datasets based on the in-distribution:
-    - For MNIST: FashionMNIST as OOD
-    - For FashionMNIST: MNIST as OOD  
-    - For CIFAR-10: SVHN as OOD (common choice in literature)
-    
-    We'll use SVHN as OOD for CIFAR-10 in-distribution.
-    """
-    # OOD dataset for CIFAR-10
+    """Configuration for Out-of-Distribution detection (SVHN as OOD)."""
     ood_dataset: str = "SVHN"
-    # SVHN statistics (for normalization consistency)
     svhn_mean: Tuple[float, float, float] = (0.4377, 0.4438, 0.4728)
     svhn_std: Tuple[float, float, float] = (0.1980, 0.2010, 0.1970)
 
 
 @dataclass
 class CalibrationConfig:
-    """Configuration for calibration measurement.
-    
-    The paper uses Expected Calibration Error (ECE) with rotated
-    inputs for calibration under distribution shift.
-    """
-    num_bins: int = 15  # For ECE computation
-    # Rotation angles for calibration under shift (degrees)
+    """Configuration for calibration measurement (ECE)."""
+    num_bins: int = 15
     rotation_angles: List[float] = field(default_factory=lambda: [
         0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180
     ])
@@ -150,7 +125,6 @@ class ExperimentConfig:
     """Main configuration combining all sub-configurations."""
     data: DataConfig = field(default_factory=DataConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
-    mcmc: MCMCConfig = field(default_factory=MCMCConfig)
     mfvi: MFVIConfig = field(default_factory=MFVIConfig)
     svgd: SVGDConfig = field(default_factory=SVGDConfig)
     temperature: TemperatureConfig = field(default_factory=TemperatureConfig)
