@@ -70,7 +70,8 @@ class DeterministicResNetTrainer:
         # Data with augmentation
         self.data_manager = DataLoaderManager(
             config.data, config.ood, config.calibration,
-            flatten=False  # Keep 3D for ResNet
+            flatten=False,  # Keep 3D for ResNet
+            save_dir=save_dir  # Save/load data split for reproducibility
         )
         
         # Model
@@ -201,14 +202,14 @@ class DeterministicResNetTrainer:
         return final_metrics
     
     def _evaluate(self) -> Tuple[float, float]:
-        """Compute validation loss and accuracy."""
+        """Compute validation loss and accuracy using VALIDATION set (not test!)."""
         self.model.eval()
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
         
         with torch.no_grad():
-            for batch_x, batch_y in self.data_manager.test_loader:
+            for batch_x, batch_y in self.data_manager.val_loader:  # USE VAL, NOT TEST!
                 batch_x = batch_x.to(self.device)
                 batch_y = batch_y.to(self.device)
                 
@@ -222,7 +223,7 @@ class DeterministicResNetTrainer:
         return total_loss / total_samples, total_correct / total_samples
     
     def _compute_final_metrics(self) -> Dict[str, float]:
-        """Compute all final test metrics."""
+        """Compute all final metrics on TEST set (only called after training is complete)."""
         self.model.eval()
         
         all_probs = []
@@ -338,7 +339,8 @@ class BayesianLastLayerTrainer:
         
         # Load data (no augmentation for Bayesian training)
         self.data_manager = DataLoaderManager(
-            config.data, config.ood, config.calibration, flatten=False
+            config.data, config.ood, config.calibration, flatten=False,
+            save_dir=save_dir  # Use same data split as Step 1
         )
         
         # Load pretrained weights
@@ -644,12 +646,12 @@ class BayesianLastLayerTrainer:
         print(f"✓ {run_name} COMPLETED ({training_time:.1f}s)")
     
     def _eval_svgd_particles(self, feature_extractor, particles) -> float:
-        """Evaluate SVGD ensemble accuracy."""
+        """Evaluate SVGD ensemble accuracy on VALIDATION set."""
         correct = 0
         total = 0
         
         with torch.no_grad():
-            for batch_x, batch_y in self.data_manager.test_loader:
+            for batch_x, batch_y in self.data_manager.val_loader:  # USE VAL, NOT TEST!
                 batch_x = batch_x.to(self.device)
                 features = feature_extractor(batch_x)
                 
@@ -822,11 +824,12 @@ class BayesianLastLayerTrainer:
         print(f"✓ {run_name} COMPLETED ({training_time:.1f}s)")
     
     def _eval_mfvi(self, model) -> float:
+        """Evaluate MFVI model accuracy on VALIDATION set."""
         model.eval()
         correct = 0
         total = 0
         with torch.no_grad():
-            for batch_x, batch_y in self.data_manager.test_loader:
+            for batch_x, batch_y in self.data_manager.val_loader:  # USE VAL, NOT TEST!
                 batch_x = batch_x.to(self.device)
                 logits = model(batch_x, num_samples=10)
                 probs = F.softmax(logits, dim=-1).mean(dim=0)
@@ -835,6 +838,7 @@ class BayesianLastLayerTrainer:
         return correct / total
     
     def _compute_mfvi_metrics(self, model) -> Dict:
+        """Compute final metrics on TEST set (only after training complete)."""
         from sklearn.metrics import roc_auc_score
         
         model.eval()
@@ -973,7 +977,8 @@ class JointTrainer:
         
         # Load data (with augmentation for joint training)
         self.data_manager = DataLoaderManager(
-            config.data, config.ood, config.calibration, flatten=False
+            config.data, config.ood, config.calibration, flatten=False,
+            save_dir=save_dir  # Use same data split as Steps 1 & 2
         )
         
         # Load pretrained weights (for feature extractor initialization)
@@ -1453,10 +1458,11 @@ class JointTrainer:
         print(f"✓ {run_name} COMPLETED ({training_time:.1f}s)")
     
     def _eval_joint_svgd(self, feature_extractor, particles) -> float:
+        """Evaluate joint SVGD on VALIDATION set."""
         correct = 0
         total = 0
         with torch.no_grad():
-            for batch_x, batch_y in self.data_manager.test_loader:
+            for batch_x, batch_y in self.data_manager.val_loader:  # USE VAL, NOT TEST!
                 batch_x = batch_x.to(self.device)
                 features = feature_extractor(batch_x)
                 probs = torch.zeros(len(batch_x), 10, device=self.device)
@@ -1468,11 +1474,12 @@ class JointTrainer:
         return correct / total
     
     def _eval_mfvi(self, model) -> float:
+        """Evaluate MFVI on VALIDATION set."""
         model.eval()
         correct = 0
         total = 0
         with torch.no_grad():
-            for batch_x, batch_y in self.data_manager.test_loader:
+            for batch_x, batch_y in self.data_manager.val_loader:  # USE VAL, NOT TEST!
                 batch_x = batch_x.to(self.device)
                 logits = model(batch_x, num_samples=10)
                 probs = F.softmax(logits, dim=-1).mean(dim=0)
@@ -1481,6 +1488,7 @@ class JointTrainer:
         return correct / total
     
     def _compute_joint_svgd_metrics(self, feature_extractor, particles) -> Dict:
+        """Compute final metrics on TEST set (only after training complete)."""
         from sklearn.metrics import roc_auc_score
         
         all_probs, all_labels = [], []
@@ -1713,8 +1721,49 @@ def print_status(save_dir: str, config: ExperimentConfig):
 # Main
 # =============================================================================
 
+def parse_run_name(name: str) -> Optional[Tuple[str, float, int]]:
+    """
+    Parse run name to extract method, temperature, and replicate.
+    
+    Examples:
+        "last_layer_svgd_T0.001_replicate_1" -> ("svgd", 0.001, 0)
+        "last_layer_mfvi_T0.1_replicate_2" -> ("mfvi", 0.1, 1)
+        "joint_svgd_T0.03_replicate_3" -> ("svgd", 0.03, 2)
+    
+    Returns:
+        Tuple of (method, temperature, replicate_index) or None if invalid
+    """
+    import re
+    
+    # Pattern for last_layer_ or joint_
+    pattern = r"(?:last_layer_|joint_)(svgd|mfvi)_T([0-9.]+)_replicate_(\d+)"
+    match = re.match(pattern, name)
+    
+    if match:
+        method = match.group(1)
+        temperature = float(match.group(2))
+        replicate = int(match.group(3)) - 1  # Convert to 0-indexed
+        return method, temperature, replicate
+    
+    return None
+
+
 def main():
-    parser = argparse.ArgumentParser(description="ResNet-based BNN pipeline")
+    parser = argparse.ArgumentParser(
+        description="ResNet-based BNN pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Run all of Step 2
+    python pipeline_resnet.py --step 2 --save-dir ./results
+    
+    # Run a single model by name
+    python pipeline_resnet.py --step 2 --save-dir ./results --name last_layer_svgd_T0.001_replicate_1
+    
+    # Run Step 3 for a single model
+    python pipeline_resnet.py --step 3 --save-dir ./results --name joint_mfvi_T0.1_replicate_2
+        """
+    )
     parser.add_argument("--step", type=int, choices=[1, 2, 3])
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--save-dir", type=str, default="./results")
@@ -1723,6 +1772,10 @@ def main():
     parser.add_argument("--mfvi-epochs", type=int, default=200, help="Epochs for Step 2 MFVI")
     parser.add_argument("--joint-svgd-epochs", type=int, default=50, help="Epochs for Step 3 SVGD")
     parser.add_argument("--joint-mfvi-epochs", type=int, default=100, help="Epochs for Step 3 MFVI")
+    parser.add_argument("--name", type=str, default=None, 
+                        help="Run a single model by name (e.g., last_layer_svgd_T0.001_replicate_1)")
+    parser.add_argument("--force", action="store_true",
+                        help="Force re-run even if model already exists")
     
     args = parser.parse_args()
     
@@ -1743,17 +1796,114 @@ def main():
         print_status(args.save_dir, config)
         return
     
+    # =========================================================================
+    # Step 1: Deterministic training (no --name support)
+    # =========================================================================
     if args.step == 1:
+        if args.name:
+            print("ERROR: --name is not supported for Step 1")
+            return
         trainer = DeterministicResNetTrainer(config, args.save_dir)
         trainer.train(num_epochs=args.epochs)
     
+    # =========================================================================
+    # Step 2: Bayesian last layer
+    # =========================================================================
     elif args.step == 2:
         trainer = BayesianLastLayerTrainer(config, args.save_dir)
-        trainer.train_all(svgd_epochs=args.svgd_epochs, mfvi_epochs=args.mfvi_epochs)
+        
+        if args.name:
+            # Parse the name
+            parsed = parse_run_name(args.name)
+            if parsed is None:
+                print(f"ERROR: Invalid run name format: {args.name}")
+                print("Expected format: last_layer_{{svgd|mfvi}}_T{{temperature}}_replicate_{{n}}")
+                print("Example: last_layer_svgd_T0.001_replicate_1")
+                return
+            
+            method, temperature, replicate = parsed
+            
+            # Check if already exists
+            if trainer._is_completed(method, temperature, replicate) and not args.force:
+                print(f"ERROR: Model already exists: {args.name}")
+                print(f"Use --force to re-run, or delete the folder:")
+                print(f"  rm -rf {trainer._get_run_dir(method, temperature, replicate)}")
+                return
+            
+            # If force, remove the COMPLETED marker
+            if args.force:
+                run_dir = trainer._get_run_dir(method, temperature, replicate)
+                completed_path = os.path.join(run_dir, "COMPLETED")
+                if os.path.exists(completed_path):
+                    os.remove(completed_path)
+                    print(f"Removed COMPLETED marker, will re-run: {args.name}")
+            
+            # Run single model
+            print(f"Running single model: {args.name}")
+            print(f"  Method: {method}, Temperature: {temperature}, Replicate: {replicate + 1}")
+            
+            epochs = args.svgd_epochs if method == "svgd" else args.mfvi_epochs
+            
+            if method == "svgd":
+                trainer._train_svgd(temperature, replicate, epochs)
+            else:
+                trainer._train_mfvi(temperature, replicate, epochs)
+        else:
+            # Run all pending
+            trainer.train_all(svgd_epochs=args.svgd_epochs, mfvi_epochs=args.mfvi_epochs)
     
+    # =========================================================================
+    # Step 3: Joint training
+    # =========================================================================
     elif args.step == 3:
         trainer = JointTrainer(config, args.save_dir)
-        trainer.train_all(svgd_epochs=args.joint_svgd_epochs, mfvi_epochs=args.joint_mfvi_epochs)
+        
+        if args.name:
+            # Parse the name
+            parsed = parse_run_name(args.name)
+            if parsed is None:
+                print(f"ERROR: Invalid run name format: {args.name}")
+                print("Expected format: joint_{{svgd|mfvi}}_T{{temperature}}_replicate_{{n}}")
+                print("Example: joint_svgd_T0.001_replicate_1")
+                return
+            
+            method, temperature, replicate = parsed
+            
+            # Check if Step 2 is done
+            if not trainer._step2_run_completed(method, temperature, replicate):
+                step2_name = f"last_layer_{method}_T{temperature}_replicate_{replicate + 1}"
+                print(f"ERROR: Step 2 not completed for this configuration")
+                print(f"Run Step 2 first: python pipeline_resnet.py --step 2 --name {step2_name}")
+                return
+            
+            # Check if already exists
+            if trainer._is_completed(method, temperature, replicate) and not args.force:
+                print(f"ERROR: Model already exists: {args.name}")
+                print(f"Use --force to re-run, or delete the folder:")
+                print(f"  rm -rf {trainer._get_run_dir(method, temperature, replicate)}")
+                return
+            
+            # If force, remove the COMPLETED marker
+            if args.force:
+                run_dir = trainer._get_run_dir(method, temperature, replicate)
+                completed_path = os.path.join(run_dir, "COMPLETED")
+                if os.path.exists(completed_path):
+                    os.remove(completed_path)
+                    print(f"Removed COMPLETED marker, will re-run: {args.name}")
+            
+            # Run single model
+            print(f"Running single model: {args.name}")
+            print(f"  Method: {method}, Temperature: {temperature}, Replicate: {replicate + 1}")
+            
+            epochs = args.joint_svgd_epochs if method == "svgd" else args.joint_mfvi_epochs
+            
+            if method == "svgd":
+                trainer._train_joint_svgd(temperature, replicate, epochs)
+            else:
+                trainer._train_joint_mfvi(temperature, replicate, epochs)
+        else:
+            # Run all pending
+            trainer.train_all(svgd_epochs=args.joint_svgd_epochs, mfvi_epochs=args.joint_mfvi_epochs)
 
 
 if __name__ == "__main__":
