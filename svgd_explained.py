@@ -346,7 +346,7 @@ class SVGDEnsemble:
         """
         logits = particle(features)  # (batch, 10)
         
-        # Negative cross-entropy = log likelihood
+        # Negative cross-entropy = log likelihoodž
         # reduction='sum' because we want total log prob, not average
         log_likelihood = -F.cross_entropy(logits, labels, reduction='sum')
         
