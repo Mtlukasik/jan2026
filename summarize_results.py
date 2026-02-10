@@ -150,6 +150,7 @@ def create_comparison_table(results: Dict[str, List[Dict]]) -> pd.DataFrame:
     if results['deterministic']:
         det = results['deterministic'][0]
         metrics = det.get('metrics', det)
+        ood_auroc = metrics.get('ood_auroc')
         all_rows.append({
             'step': 'Baseline',
             'method': 'Deterministic',
@@ -157,7 +158,7 @@ def create_comparison_table(results: Dict[str, List[Dict]]) -> pd.DataFrame:
             'error': f"{metrics.get('error', 0)*100:.2f}%",
             'nll': f"{metrics.get('nll', 0):.4f}",
             'ece': f"{metrics.get('ece', 0):.4f}",
-            'ood_auroc': f"{metrics.get('ood_auroc', '-')}",
+            'ood_auroc': f"{ood_auroc:.4f}" if ood_auroc is not None else "-",
             'n': 1
         })
     
@@ -247,6 +248,7 @@ def plot_metric_vs_temperature(
 ):
     """
     Plot a metric vs temperature for SVGD and MFVI (Step 2 and Step 3).
+    Includes deterministic baseline as horizontal dashed line.
     """
     if not HAS_MATPLOTLIB:
         return
@@ -259,6 +261,13 @@ def plot_metric_vs_temperature(
         'ece': 'Expected Calibration Error',
         'ood_auroc': 'OOD Detection AUROC'
     }
+    
+    # Get deterministic baseline value
+    det_value = None
+    if results['deterministic']:
+        det = results['deterministic'][0]
+        det_metrics = det.get('metrics', det)
+        det_value = det_metrics.get(metric)
     
     # Step 2
     ax = axes[0]
@@ -277,6 +286,11 @@ def plot_metric_vs_temperature(
                 linewidth=2,
                 markersize=8
             )
+    
+    # Add deterministic baseline
+    if det_value is not None:
+        ax.axhline(y=det_value, color='black', linestyle='--', linewidth=2, 
+                   label=f'Deterministic ({det_value:.4f})')
     
     ax.set_xscale('log')
     ax.set_xlabel('Temperature', fontsize=12)
@@ -303,6 +317,11 @@ def plot_metric_vs_temperature(
                 markersize=8
             )
     
+    # Add deterministic baseline
+    if det_value is not None:
+        ax.axhline(y=det_value, color='black', linestyle='--', linewidth=2,
+                   label=f'Deterministic ({det_value:.4f})')
+    
     ax.set_xscale('log')
     ax.set_xlabel('Temperature', fontsize=12)
     ax.set_ylabel(metric_labels.get(metric, metric), fontsize=12)
@@ -320,7 +339,7 @@ def plot_metric_vs_temperature(
 
 def plot_comparison_grid(results: Dict[str, List[Dict]], output_path: str):
     """
-    Create a 2x2 grid comparing all metrics.
+    Create a 2x2 grid comparing all metrics with deterministic baseline.
     """
     if not HAS_MATPLOTLIB:
         return
@@ -330,8 +349,16 @@ def plot_comparison_grid(results: Dict[str, List[Dict]], output_path: str):
     metrics = [('error', 'Error Rate'), ('nll', 'NLL'), 
                ('ece', 'ECE'), ('ood_auroc', 'OOD AUROC')]
     
+    # Get deterministic baseline values
+    det_values = {}
+    if results['deterministic']:
+        det = results['deterministic'][0]
+        det_metrics = det.get('metrics', det)
+        for metric, _ in metrics:
+            det_values[metric] = det_metrics.get(metric)
+    
     for ax, (metric, label) in zip(axes.flat, metrics):
-        # Step 2
+        # Plot Step 2 and Step 3 results
         for method, key, color, marker, ls in [
             ('SVGD (Step2)', 'step2_svgd', 'blue', 'o', '-'),
             ('MFVI (Step2)', 'step2_mfvi', 'red', 's', '-'),
@@ -352,6 +379,11 @@ def plot_comparison_grid(results: Dict[str, List[Dict]], output_path: str):
                     linewidth=2,
                     markersize=6
                 )
+        
+        # Add deterministic baseline
+        if metric in det_values and det_values[metric] is not None:
+            ax.axhline(y=det_values[metric], color='black', linestyle=':', linewidth=2,
+                       label=f'Deterministic')
         
         ax.set_xscale('log')
         ax.set_xlabel('Temperature')
@@ -379,10 +411,15 @@ def print_summary(results: Dict[str, List[Dict]]):
         det = results['deterministic'][0]
         metrics = det.get('metrics', det)
         print("\n📊 BASELINE (Deterministic ResNet-18):")
-        print(f"   Error:    {metrics.get('error', 0)*100:.2f}%")
-        print(f"   Accuracy: {(1-metrics.get('error', 0))*100:.2f}%")
-        print(f"   NLL:      {metrics.get('nll', 0):.4f}")
-        print(f"   ECE:      {metrics.get('ece', 0):.4f}")
+        print(f"   Error:      {metrics.get('error', 0)*100:.2f}%")
+        print(f"   Accuracy:   {(1-metrics.get('error', 0))*100:.2f}%")
+        print(f"   NLL:        {metrics.get('nll', 0):.4f}")
+        print(f"   ECE:        {metrics.get('ece', 0):.4f}")
+        if metrics.get('ood_auroc') is not None:
+            print(f"   OOD AUROC:  {metrics.get('ood_auroc'):.4f} (using Shannon entropy)")
+        if metrics.get('mean_in_entropy') is not None:
+            print(f"   Mean In-Dist Entropy:  {metrics.get('mean_in_entropy'):.4f}")
+            print(f"   Mean OOD Entropy:      {metrics.get('mean_ood_entropy'):.4f}")
     
     # Best results for each method
     for step_name, step_keys in [("Step 2 (Frozen Features)", ['step2_svgd', 'step2_mfvi']),
