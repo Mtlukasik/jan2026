@@ -871,12 +871,13 @@ class BayesianLastLayerTrainer:
         # OOD AUROC using entropy
         def get_entropy(loader):
             entropies = []
-            for batch_x, _ in loader:
-                batch_x = batch_x.to(self.device)
-                logits = model(batch_x, num_samples=10)
-                probs = F.softmax(logits, dim=-1).mean(dim=0)
-                ent = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-                entropies.append(ent.cpu())
+            with torch.no_grad():  # CRITICAL: prevent gradient tracking
+                for batch_x, _ in loader:
+                    batch_x = batch_x.to(self.device)
+                    logits = model(batch_x, num_samples=10)
+                    probs = F.softmax(logits, dim=-1).mean(dim=0)
+                    ent = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
+                    entropies.append(ent.cpu())
             return torch.cat(entropies)
         
         in_ent = get_entropy(self.data_manager.test_loader)
@@ -1572,12 +1573,13 @@ class JointTrainer:
         
         def get_entropy(loader):
             entropies = []
-            for batch_x, _ in loader:
-                batch_x = batch_x.to(self.device)
-                logits = model(batch_x, num_samples=10)
-                probs = F.softmax(logits, dim=-1).mean(dim=0)
-                ent = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-                entropies.append(ent.cpu())
+            with torch.no_grad():  # CRITICAL: prevent gradient tracking
+                for batch_x, _ in loader:
+                    batch_x = batch_x.to(self.device)
+                    logits = model(batch_x, num_samples=10)
+                    probs = F.softmax(logits, dim=-1).mean(dim=0)
+                    ent = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
+                    entropies.append(ent.cpu())
             return torch.cat(entropies)
         
         in_ent = get_entropy(self.data_manager.test_loader)
