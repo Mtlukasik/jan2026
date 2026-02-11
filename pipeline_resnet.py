@@ -223,22 +223,47 @@ class DeterministicResNetTrainer:
         return total_loss / total_samples, total_correct / total_samples
     
     def _compute_final_metrics(self) -> Dict[str, float]:
-        """Compute all final metrics on TEST set (only called after training is complete)."""
+        """
+        Compute all final metrics on TEST set (only called after training is complete).
+        
+        For OOD detection, we use Shannon entropy of softmax outputs.
+        For deterministic models, this represents aleatoric uncertainty only
+        (no epistemic uncertainty since there's no weight distribution).
+        """
+        from sklearn.metrics import roc_auc_score
+        
         self.model.eval()
         
         all_probs = []
         all_labels = []
+        in_entropy = []  # Entropy on in-distribution (test set)
         
         with torch.no_grad():
+            # In-distribution (CIFAR-10 test)
             for batch_x, batch_y in self.data_manager.test_loader:
                 batch_x = batch_x.to(self.device)
                 probs = F.softmax(self.model(batch_x), dim=-1)
                 all_probs.append(probs.cpu())
                 all_labels.append(batch_y)
+                
+                # Shannon entropy: H = -Σ p(y) log p(y)
+                entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
+                in_entropy.append(entropy.cpu())
+            
+            # Out-of-distribution (SVHN)
+            ood_entropy = []
+            for batch_x, _ in self.data_manager.ood_loader:
+                batch_x = batch_x.to(self.device)
+                probs = F.softmax(self.model(batch_x), dim=-1)
+                entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
+                ood_entropy.append(entropy.cpu())
         
         all_probs = torch.cat(all_probs, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
+        in_entropy = torch.cat(in_entropy, dim=0)
+        ood_entropy = torch.cat(ood_entropy, dim=0)
         
+        # Basic metrics
         preds = all_probs.argmax(dim=-1)
         error = (preds != all_labels).float().mean().item()
         nll = F.nll_loss(torch.log(all_probs + 1e-10), all_labels).item()
@@ -253,7 +278,25 @@ class DeterministicResNetTrainer:
             if in_bin.sum() > 0:
                 ece += torch.abs(accuracies[in_bin].mean() - confidences[in_bin].mean()) * in_bin.float().mean()
         
-        return {"error": error, "nll": nll, "ece": ece.item(), "accuracy": 1 - error}
+        # OOD AUROC using entropy
+        # Higher entropy on OOD = better detection
+        labels = np.concatenate([np.zeros(len(in_entropy)), np.ones(len(ood_entropy))])
+        scores = np.concatenate([in_entropy.numpy(), ood_entropy.numpy()])
+        ood_auroc = roc_auc_score(labels, scores)
+        
+        # Also compute mean entropy for reference
+        mean_in_entropy = in_entropy.mean().item()
+        mean_ood_entropy = ood_entropy.mean().item()
+        
+        return {
+            "error": error, 
+            "nll": nll, 
+            "ece": ece.item(), 
+            "accuracy": 1 - error,
+            "ood_auroc": ood_auroc,
+            "mean_in_entropy": mean_in_entropy,
+            "mean_ood_entropy": mean_ood_entropy
+        }
     
     def _save_weights(self):
         torch.save(self.model.state_dict(), self.get_weights_path())
@@ -527,10 +570,14 @@ class BayesianLastLayerTrainer:
             return torch.exp(-dists_sq / (2 * h)), h
         
         def log_prior(params):
-            """Laplace prior: -|θ|/σ"""
-            if self.config.svgd.use_laplace_prior:
+            """
+            Compute log prior.
+            Laplace: -|θ|/σ  (encourages sparsity)
+            Gaussian: -θ²/(2σ²)  (L2 regularization)
+            """
+            if self.config.svgd.prior_type == "laplace":
                 return -torch.sum(torch.abs(params)) / self.config.svgd.prior_std
-            else:
+            else:  # gaussian
                 return -0.5 * torch.sum(params ** 2) / (self.config.svgd.prior_std ** 2)
         
         # =====================================================================
@@ -667,46 +714,99 @@ class BayesianLastLayerTrainer:
         return correct / total
     
     def _compute_svgd_metrics_particles(self, feature_extractor, particles) -> Dict:
-        """Compute all metrics for SVGD ensemble."""
+        """
+        Compute all metrics for SVGD ensemble with entropy decomposition.
+        
+        Entropy Decomposition:
+            Total = Aleatoric + Epistemic
+            
+            Total:     H[E_θ[p(y|x,θ)]] = -Σ p̄(y) log p̄(y)  where p̄ = mean over particles
+            Aleatoric: E_θ[H[p(y|x,θ)]] = mean of individual particle entropies
+            Epistemic: Total - Aleatoric = mutual information I[y; θ|x]
+        """
         from sklearn.metrics import roc_auc_score
         
         all_probs, all_labels = [], []
-        in_entropy, ood_entropy = [], []
         
-        # Test set predictions
+        # Entropy components for in-distribution
+        in_total_entropy = []
+        in_aleatoric_entropy = []
+        in_epistemic_entropy = []
+        
+        # Entropy components for OOD
+        ood_total_entropy = []
+        ood_aleatoric_entropy = []
+        ood_epistemic_entropy = []
+        
+        n_particles = len(particles)
+        
         with torch.no_grad():
+            # In-distribution (test set)
             for batch_x, batch_y in self.data_manager.test_loader:
                 batch_x = batch_x.to(self.device)
                 features = feature_extractor(batch_x)
                 
-                probs = torch.zeros(len(batch_x), 10, device=self.device)
+                # Get predictions from each particle
+                particle_probs = []
                 for particle in particles:
-                    probs += F.softmax(particle(features), dim=-1)
-                probs /= len(particles)
+                    p = F.softmax(particle(features), dim=-1)
+                    particle_probs.append(p)
                 
-                all_probs.append(probs.cpu())
+                # Stack: (n_particles, batch, 10)
+                particle_probs = torch.stack(particle_probs)
+                
+                # Mean prediction: p̄(y|x) = (1/n) Σᵢ p(y|x,θᵢ)
+                mean_probs = particle_probs.mean(dim=0)  # (batch, 10)
+                
+                # Total entropy: H[p̄(y|x)]
+                total_ent = -torch.sum(mean_probs * torch.log(mean_probs + 1e-10), dim=-1)
+                
+                # Aleatoric: E[H[p(y|x,θ)]] = (1/n) Σᵢ H[p(y|x,θᵢ)]
+                individual_entropies = -torch.sum(particle_probs * torch.log(particle_probs + 1e-10), dim=-1)  # (n_particles, batch)
+                aleatoric_ent = individual_entropies.mean(dim=0)  # (batch,)
+                
+                # Epistemic: Total - Aleatoric (mutual information)
+                epistemic_ent = total_ent - aleatoric_ent
+                
+                all_probs.append(mean_probs.cpu())
                 all_labels.append(batch_y)
-                
-                entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-                in_entropy.append(entropy.cpu())
+                in_total_entropy.append(total_ent.cpu())
+                in_aleatoric_entropy.append(aleatoric_ent.cpu())
+                in_epistemic_entropy.append(epistemic_ent.cpu())
             
-            # OOD entropy
+            # OOD (SVHN)
             for batch_x, _ in self.data_manager.ood_loader:
                 batch_x = batch_x.to(self.device)
                 features = feature_extractor(batch_x)
                 
-                probs = torch.zeros(len(batch_x), 10, device=self.device)
+                particle_probs = []
                 for particle in particles:
-                    probs += F.softmax(particle(features), dim=-1)
-                probs /= len(particles)
+                    p = F.softmax(particle(features), dim=-1)
+                    particle_probs.append(p)
                 
-                entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-                ood_entropy.append(entropy.cpu())
+                particle_probs = torch.stack(particle_probs)
+                mean_probs = particle_probs.mean(dim=0)
+                
+                total_ent = -torch.sum(mean_probs * torch.log(mean_probs + 1e-10), dim=-1)
+                individual_entropies = -torch.sum(particle_probs * torch.log(particle_probs + 1e-10), dim=-1)
+                aleatoric_ent = individual_entropies.mean(dim=0)
+                epistemic_ent = total_ent - aleatoric_ent
+                
+                ood_total_entropy.append(total_ent.cpu())
+                ood_aleatoric_entropy.append(aleatoric_ent.cpu())
+                ood_epistemic_entropy.append(epistemic_ent.cpu())
         
+        # Concatenate
         all_probs = torch.cat(all_probs)
         all_labels = torch.cat(all_labels)
-        in_entropy = torch.cat(in_entropy)
-        ood_entropy = torch.cat(ood_entropy)
+        
+        in_total = torch.cat(in_total_entropy)
+        in_aleatoric = torch.cat(in_aleatoric_entropy)
+        in_epistemic = torch.cat(in_epistemic_entropy)
+        
+        ood_total = torch.cat(ood_total_entropy)
+        ood_aleatoric = torch.cat(ood_aleatoric_entropy)
+        ood_epistemic = torch.cat(ood_epistemic_entropy)
         
         # Error
         error = (all_probs.argmax(-1) != all_labels).float().mean().item()
@@ -724,12 +824,37 @@ class BayesianLastLayerTrainer:
             if mask.sum() > 0:
                 ece += torch.abs(acc[mask].mean() - conf[mask].mean()) * mask.float().mean()
         
-        # OOD AUROC
-        labels = np.concatenate([np.zeros(len(in_entropy)), np.ones(len(ood_entropy))])
-        scores = np.concatenate([in_entropy.numpy(), ood_entropy.numpy()])
-        ood_auroc = roc_auc_score(labels, scores)
+        # OOD AUROC using different entropy types
+        labels = np.concatenate([np.zeros(len(in_total)), np.ones(len(ood_total))])
         
-        return {"error": error, "nll": nll, "ece": ece.item() if isinstance(ece, torch.Tensor) else ece, "ood_auroc": ood_auroc}
+        # Total entropy (aleatoric + epistemic)
+        scores_total = np.concatenate([in_total.numpy(), ood_total.numpy()])
+        ood_auroc_total = roc_auc_score(labels, scores_total)
+        
+        # Aleatoric only
+        scores_aleatoric = np.concatenate([in_aleatoric.numpy(), ood_aleatoric.numpy()])
+        ood_auroc_aleatoric = roc_auc_score(labels, scores_aleatoric)
+        
+        # Epistemic only
+        scores_epistemic = np.concatenate([in_epistemic.numpy(), ood_epistemic.numpy()])
+        ood_auroc_epistemic = roc_auc_score(labels, scores_epistemic)
+        
+        return {
+            "error": error, 
+            "nll": nll, 
+            "ece": ece.item() if isinstance(ece, torch.Tensor) else ece, 
+            "ood_auroc": ood_auroc_total,  # Total entropy (backward compatible)
+            "ood_auroc_total": ood_auroc_total,
+            "ood_auroc_aleatoric": ood_auroc_aleatoric,
+            "ood_auroc_epistemic": ood_auroc_epistemic,
+            # Mean entropies for analysis
+            "mean_in_total_entropy": in_total.mean().item(),
+            "mean_in_aleatoric_entropy": in_aleatoric.mean().item(),
+            "mean_in_epistemic_entropy": in_epistemic.mean().item(),
+            "mean_ood_total_entropy": ood_total.mean().item(),
+            "mean_ood_aleatoric_entropy": ood_aleatoric.mean().item(),
+            "mean_ood_epistemic_entropy": ood_epistemic.mean().item(),
+        }
     
     def _train_mfvi(self, temperature: float, replicate: int, num_epochs: int):
         """Train MFVI with frozen ResNet features."""
@@ -838,23 +963,93 @@ class BayesianLastLayerTrainer:
         return correct / total
     
     def _compute_mfvi_metrics(self, model) -> Dict:
-        """Compute final metrics on TEST set (only after training complete)."""
+        """
+        Compute final metrics on TEST set with entropy decomposition.
+        
+        For MFVI, we sample from the weight posterior multiple times.
+        Entropy Decomposition:
+            Total:     H[E_θ[p(y|x,θ)]] - entropy of mean prediction
+            Aleatoric: E_θ[H[p(y|x,θ)]] - mean entropy across samples
+            Epistemic: Total - Aleatoric
+        """
         from sklearn.metrics import roc_auc_score
         
         model.eval()
+        num_samples = 10  # Number of weight samples
+        
         all_probs, all_labels = [], []
         
+        # Entropy components
+        in_total_entropy, in_aleatoric_entropy, in_epistemic_entropy = [], [], []
+        ood_total_entropy, ood_aleatoric_entropy, ood_epistemic_entropy = [], [], []
+        
         with torch.no_grad():
+            # In-distribution
             for batch_x, batch_y in self.data_manager.test_loader:
                 batch_x = batch_x.to(self.device)
-                logits = model(batch_x, num_samples=10)
-                probs = F.softmax(logits, dim=-1).mean(dim=0)
-                all_probs.append(probs.cpu())
+                
+                # Get predictions from multiple weight samples
+                sample_probs = []
+                for _ in range(num_samples):
+                    logits = model(batch_x, num_samples=1)
+                    p = F.softmax(logits, dim=-1)
+                    sample_probs.append(p)
+                
+                # Stack: (num_samples, batch, 10)
+                sample_probs = torch.stack(sample_probs)
+                mean_probs = sample_probs.mean(dim=0)  # (batch, 10)
+                
+                # Total entropy
+                total_ent = -torch.sum(mean_probs * torch.log(mean_probs + 1e-10), dim=-1)
+                
+                # Aleatoric: mean of individual sample entropies
+                individual_ent = -torch.sum(sample_probs * torch.log(sample_probs + 1e-10), dim=-1)  # (num_samples, batch)
+                aleatoric_ent = individual_ent.mean(dim=0)
+                
+                # Epistemic
+                epistemic_ent = total_ent - aleatoric_ent
+                
+                all_probs.append(mean_probs.cpu())
                 all_labels.append(batch_y)
+                in_total_entropy.append(total_ent.cpu())
+                in_aleatoric_entropy.append(aleatoric_ent.cpu())
+                in_epistemic_entropy.append(epistemic_ent.cpu())
+            
+            # OOD
+            for batch_x, _ in self.data_manager.ood_loader:
+                batch_x = batch_x.to(self.device)
+                
+                sample_probs = []
+                for _ in range(num_samples):
+                    logits = model(batch_x, num_samples=1)
+                    p = F.softmax(logits, dim=-1)
+                    sample_probs.append(p)
+                
+                sample_probs = torch.stack(sample_probs)
+                mean_probs = sample_probs.mean(dim=0)
+                
+                total_ent = -torch.sum(mean_probs * torch.log(mean_probs + 1e-10), dim=-1)
+                individual_ent = -torch.sum(sample_probs * torch.log(sample_probs + 1e-10), dim=-1)
+                aleatoric_ent = individual_ent.mean(dim=0)
+                epistemic_ent = total_ent - aleatoric_ent
+                
+                ood_total_entropy.append(total_ent.cpu())
+                ood_aleatoric_entropy.append(aleatoric_ent.cpu())
+                ood_epistemic_entropy.append(epistemic_ent.cpu())
         
+        # Concatenate
         all_probs = torch.cat(all_probs)
         all_labels = torch.cat(all_labels)
         
+        in_total = torch.cat(in_total_entropy)
+        in_aleatoric = torch.cat(in_aleatoric_entropy)
+        in_epistemic = torch.cat(in_epistemic_entropy)
+        
+        ood_total = torch.cat(ood_total_entropy)
+        ood_aleatoric = torch.cat(ood_aleatoric_entropy)
+        ood_epistemic = torch.cat(ood_epistemic_entropy)
+        
+        # Basic metrics
         error = (all_probs.argmax(-1) != all_labels).float().mean().item()
         nll = F.nll_loss(torch.log(all_probs + 1e-10), all_labels).item()
         
@@ -868,26 +1063,33 @@ class BayesianLastLayerTrainer:
             if mask.sum() > 0:
                 ece += torch.abs(acc[mask].mean() - conf[mask].mean()) * mask.float().mean()
         
-        # OOD AUROC using entropy
-        def get_entropy(loader):
-            entropies = []
-            with torch.no_grad():  # CRITICAL: prevent gradient tracking
-                for batch_x, _ in loader:
-                    batch_x = batch_x.to(self.device)
-                    logits = model(batch_x, num_samples=10)
-                    probs = F.softmax(logits, dim=-1).mean(dim=0)
-                    ent = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-                    entropies.append(ent.cpu())
-            return torch.cat(entropies)
+        # OOD AUROC for each entropy type
+        labels = np.concatenate([np.zeros(len(in_total)), np.ones(len(ood_total))])
         
-        in_ent = get_entropy(self.data_manager.test_loader)
-        ood_ent = get_entropy(self.data_manager.ood_loader)
+        scores_total = np.concatenate([in_total.numpy(), ood_total.numpy()])
+        ood_auroc_total = roc_auc_score(labels, scores_total)
         
-        labels = np.concatenate([np.zeros(len(in_ent)), np.ones(len(ood_ent))])
-        scores = np.concatenate([in_ent.numpy(), ood_ent.numpy()])
-        ood_auroc = roc_auc_score(labels, scores)
+        scores_aleatoric = np.concatenate([in_aleatoric.numpy(), ood_aleatoric.numpy()])
+        ood_auroc_aleatoric = roc_auc_score(labels, scores_aleatoric)
         
-        return {"error": error, "nll": nll, "ece": ece.item() if isinstance(ece, torch.Tensor) else ece, "ood_auroc": ood_auroc}
+        scores_epistemic = np.concatenate([in_epistemic.numpy(), ood_epistemic.numpy()])
+        ood_auroc_epistemic = roc_auc_score(labels, scores_epistemic)
+        
+        return {
+            "error": error, 
+            "nll": nll, 
+            "ece": ece.item() if isinstance(ece, torch.Tensor) else ece, 
+            "ood_auroc": ood_auroc_total,
+            "ood_auroc_total": ood_auroc_total,
+            "ood_auroc_aleatoric": ood_auroc_aleatoric,
+            "ood_auroc_epistemic": ood_auroc_epistemic,
+            "mean_in_total_entropy": in_total.mean().item(),
+            "mean_in_aleatoric_entropy": in_aleatoric.mean().item(),
+            "mean_in_epistemic_entropy": in_epistemic.mean().item(),
+            "mean_ood_total_entropy": ood_total.mean().item(),
+            "mean_ood_aleatoric_entropy": ood_aleatoric.mean().item(),
+            "mean_ood_epistemic_entropy": ood_epistemic.mean().item(),
+        }
     
     def _save_run(self, run_dir, method, temperature, replicate, metrics, history, training_time):
         with open(os.path.join(run_dir, "results.json"), 'w') as f:
@@ -1220,9 +1422,10 @@ class JointTrainer:
             return torch.exp(-dists_sq / (2 * h)), h
         
         def log_prior(params):
-            if self.config.svgd.use_laplace_prior:
+            """Compute log prior based on config."""
+            if self.config.svgd.prior_type == "laplace":
                 return -torch.sum(torch.abs(params)) / self.config.svgd.prior_std
-            else:
+            else:  # gaussian
                 return -0.5 * torch.sum(params ** 2) / (self.config.svgd.prior_std ** 2)
         
         # =====================================================================
@@ -1489,39 +1692,70 @@ class JointTrainer:
         return correct / total
     
     def _compute_joint_svgd_metrics(self, feature_extractor, particles) -> Dict:
-        """Compute final metrics on TEST set (only after training complete)."""
+        """Compute final metrics on TEST set with entropy decomposition."""
         from sklearn.metrics import roc_auc_score
         
         all_probs, all_labels = [], []
-        in_entropy, ood_entropy = [], []
+        in_total_entropy, in_aleatoric_entropy, in_epistemic_entropy = [], [], []
+        ood_total_entropy, ood_aleatoric_entropy, ood_epistemic_entropy = [], [], []
+        
+        n_particles = len(particles)
         
         with torch.no_grad():
             for batch_x, batch_y in self.data_manager.test_loader:
                 batch_x = batch_x.to(self.device)
                 features = feature_extractor(batch_x)
-                probs = torch.zeros(len(batch_x), 10, device=self.device)
+                
+                particle_probs = []
                 for particle in particles:
-                    probs += F.softmax(particle(features), dim=-1)
-                probs /= len(particles)
-                all_probs.append(probs.cpu())
+                    p = F.softmax(particle(features), dim=-1)
+                    particle_probs.append(p)
+                
+                particle_probs = torch.stack(particle_probs)
+                mean_probs = particle_probs.mean(dim=0)
+                
+                total_ent = -torch.sum(mean_probs * torch.log(mean_probs + 1e-10), dim=-1)
+                individual_ent = -torch.sum(particle_probs * torch.log(particle_probs + 1e-10), dim=-1)
+                aleatoric_ent = individual_ent.mean(dim=0)
+                epistemic_ent = total_ent - aleatoric_ent
+                
+                all_probs.append(mean_probs.cpu())
                 all_labels.append(batch_y)
-                entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-                in_entropy.append(entropy.cpu())
+                in_total_entropy.append(total_ent.cpu())
+                in_aleatoric_entropy.append(aleatoric_ent.cpu())
+                in_epistemic_entropy.append(epistemic_ent.cpu())
             
             for batch_x, _ in self.data_manager.ood_loader:
                 batch_x = batch_x.to(self.device)
                 features = feature_extractor(batch_x)
-                probs = torch.zeros(len(batch_x), 10, device=self.device)
+                
+                particle_probs = []
                 for particle in particles:
-                    probs += F.softmax(particle(features), dim=-1)
-                probs /= len(particles)
-                entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-                ood_entropy.append(entropy.cpu())
+                    p = F.softmax(particle(features), dim=-1)
+                    particle_probs.append(p)
+                
+                particle_probs = torch.stack(particle_probs)
+                mean_probs = particle_probs.mean(dim=0)
+                
+                total_ent = -torch.sum(mean_probs * torch.log(mean_probs + 1e-10), dim=-1)
+                individual_ent = -torch.sum(particle_probs * torch.log(particle_probs + 1e-10), dim=-1)
+                aleatoric_ent = individual_ent.mean(dim=0)
+                epistemic_ent = total_ent - aleatoric_ent
+                
+                ood_total_entropy.append(total_ent.cpu())
+                ood_aleatoric_entropy.append(aleatoric_ent.cpu())
+                ood_epistemic_entropy.append(epistemic_ent.cpu())
         
         all_probs = torch.cat(all_probs)
         all_labels = torch.cat(all_labels)
-        in_entropy = torch.cat(in_entropy)
-        ood_entropy = torch.cat(ood_entropy)
+        
+        in_total = torch.cat(in_total_entropy)
+        in_aleatoric = torch.cat(in_aleatoric_entropy)
+        in_epistemic = torch.cat(in_epistemic_entropy)
+        
+        ood_total = torch.cat(ood_total_entropy)
+        ood_aleatoric = torch.cat(ood_aleatoric_entropy)
+        ood_epistemic = torch.cat(ood_epistemic_entropy)
         
         error = (all_probs.argmax(-1) != all_labels).float().mean().item()
         nll = F.nll_loss(torch.log(all_probs + 1e-10), all_labels).item()
@@ -1535,29 +1769,98 @@ class JointTrainer:
             if mask.sum() > 0:
                 ece += torch.abs(acc[mask].mean() - conf[mask].mean()) * mask.float().mean()
         
-        labels = np.concatenate([np.zeros(len(in_entropy)), np.ones(len(ood_entropy))])
-        scores = np.concatenate([in_entropy.numpy(), ood_entropy.numpy()])
-        ood_auroc = roc_auc_score(labels, scores)
+        labels = np.concatenate([np.zeros(len(in_total)), np.ones(len(ood_total))])
         
-        return {"error": error, "nll": nll, "ece": ece.item() if isinstance(ece, torch.Tensor) else ece, 
-                "ood_auroc": ood_auroc, "accuracy": 1 - error}
+        scores_total = np.concatenate([in_total.numpy(), ood_total.numpy()])
+        ood_auroc_total = roc_auc_score(labels, scores_total)
+        
+        scores_aleatoric = np.concatenate([in_aleatoric.numpy(), ood_aleatoric.numpy()])
+        ood_auroc_aleatoric = roc_auc_score(labels, scores_aleatoric)
+        
+        scores_epistemic = np.concatenate([in_epistemic.numpy(), ood_epistemic.numpy()])
+        ood_auroc_epistemic = roc_auc_score(labels, scores_epistemic)
+        
+        return {
+            "error": error, "nll": nll, 
+            "ece": ece.item() if isinstance(ece, torch.Tensor) else ece, 
+            "ood_auroc": ood_auroc_total, "accuracy": 1 - error,
+            "ood_auroc_total": ood_auroc_total,
+            "ood_auroc_aleatoric": ood_auroc_aleatoric,
+            "ood_auroc_epistemic": ood_auroc_epistemic,
+            "mean_in_total_entropy": in_total.mean().item(),
+            "mean_in_aleatoric_entropy": in_aleatoric.mean().item(),
+            "mean_in_epistemic_entropy": in_epistemic.mean().item(),
+            "mean_ood_total_entropy": ood_total.mean().item(),
+            "mean_ood_aleatoric_entropy": ood_aleatoric.mean().item(),
+            "mean_ood_epistemic_entropy": ood_epistemic.mean().item(),
+        }
     
     def _compute_mfvi_metrics(self, model) -> Dict:
+        """Compute final MFVI metrics with entropy decomposition."""
         from sklearn.metrics import roc_auc_score
         
         model.eval()
+        num_samples = 10
+        
         all_probs, all_labels = [], []
+        in_total_entropy, in_aleatoric_entropy, in_epistemic_entropy = [], [], []
+        ood_total_entropy, ood_aleatoric_entropy, ood_epistemic_entropy = [], [], []
         
         with torch.no_grad():
             for batch_x, batch_y in self.data_manager.test_loader:
                 batch_x = batch_x.to(self.device)
-                logits = model(batch_x, num_samples=10)
-                probs = F.softmax(logits, dim=-1).mean(dim=0)
-                all_probs.append(probs.cpu())
+                
+                sample_probs = []
+                for _ in range(num_samples):
+                    logits = model(batch_x, num_samples=1)
+                    p = F.softmax(logits, dim=-1)
+                    sample_probs.append(p)
+                
+                sample_probs = torch.stack(sample_probs)
+                mean_probs = sample_probs.mean(dim=0)
+                
+                total_ent = -torch.sum(mean_probs * torch.log(mean_probs + 1e-10), dim=-1)
+                individual_ent = -torch.sum(sample_probs * torch.log(sample_probs + 1e-10), dim=-1)
+                aleatoric_ent = individual_ent.mean(dim=0)
+                epistemic_ent = total_ent - aleatoric_ent
+                
+                all_probs.append(mean_probs.cpu())
                 all_labels.append(batch_y)
+                in_total_entropy.append(total_ent.cpu())
+                in_aleatoric_entropy.append(aleatoric_ent.cpu())
+                in_epistemic_entropy.append(epistemic_ent.cpu())
+            
+            for batch_x, _ in self.data_manager.ood_loader:
+                batch_x = batch_x.to(self.device)
+                
+                sample_probs = []
+                for _ in range(num_samples):
+                    logits = model(batch_x, num_samples=1)
+                    p = F.softmax(logits, dim=-1)
+                    sample_probs.append(p)
+                
+                sample_probs = torch.stack(sample_probs)
+                mean_probs = sample_probs.mean(dim=0)
+                
+                total_ent = -torch.sum(mean_probs * torch.log(mean_probs + 1e-10), dim=-1)
+                individual_ent = -torch.sum(sample_probs * torch.log(sample_probs + 1e-10), dim=-1)
+                aleatoric_ent = individual_ent.mean(dim=0)
+                epistemic_ent = total_ent - aleatoric_ent
+                
+                ood_total_entropy.append(total_ent.cpu())
+                ood_aleatoric_entropy.append(aleatoric_ent.cpu())
+                ood_epistemic_entropy.append(epistemic_ent.cpu())
         
         all_probs = torch.cat(all_probs)
         all_labels = torch.cat(all_labels)
+        
+        in_total = torch.cat(in_total_entropy)
+        in_aleatoric = torch.cat(in_aleatoric_entropy)
+        in_epistemic = torch.cat(in_epistemic_entropy)
+        
+        ood_total = torch.cat(ood_total_entropy)
+        ood_aleatoric = torch.cat(ood_aleatoric_entropy)
+        ood_epistemic = torch.cat(ood_epistemic_entropy)
         
         error = (all_probs.argmax(-1) != all_labels).float().mean().item()
         nll = F.nll_loss(torch.log(all_probs + 1e-10), all_labels).item()
@@ -1571,25 +1874,31 @@ class JointTrainer:
             if mask.sum() > 0:
                 ece += torch.abs(acc[mask].mean() - conf[mask].mean()) * mask.float().mean()
         
-        def get_entropy(loader):
-            entropies = []
-            with torch.no_grad():  # CRITICAL: prevent gradient tracking
-                for batch_x, _ in loader:
-                    batch_x = batch_x.to(self.device)
-                    logits = model(batch_x, num_samples=10)
-                    probs = F.softmax(logits, dim=-1).mean(dim=0)
-                    ent = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-                    entropies.append(ent.cpu())
-            return torch.cat(entropies)
+        labels = np.concatenate([np.zeros(len(in_total)), np.ones(len(ood_total))])
         
-        in_ent = get_entropy(self.data_manager.test_loader)
-        ood_ent = get_entropy(self.data_manager.ood_loader)
+        scores_total = np.concatenate([in_total.numpy(), ood_total.numpy()])
+        ood_auroc_total = roc_auc_score(labels, scores_total)
         
-        labels = np.concatenate([np.zeros(len(in_ent)), np.ones(len(ood_ent))])
-        scores = np.concatenate([in_ent.numpy(), ood_ent.numpy()])
-        ood_auroc = roc_auc_score(labels, scores)
+        scores_aleatoric = np.concatenate([in_aleatoric.numpy(), ood_aleatoric.numpy()])
+        ood_auroc_aleatoric = roc_auc_score(labels, scores_aleatoric)
         
-        return {"error": error, "nll": nll, "ece": ece.item() if isinstance(ece, torch.Tensor) else ece, "ood_auroc": ood_auroc}
+        scores_epistemic = np.concatenate([in_epistemic.numpy(), ood_epistemic.numpy()])
+        ood_auroc_epistemic = roc_auc_score(labels, scores_epistemic)
+        
+        return {
+            "error": error, "nll": nll, 
+            "ece": ece.item() if isinstance(ece, torch.Tensor) else ece, 
+            "ood_auroc": ood_auroc_total,
+            "ood_auroc_total": ood_auroc_total,
+            "ood_auroc_aleatoric": ood_auroc_aleatoric,
+            "ood_auroc_epistemic": ood_auroc_epistemic,
+            "mean_in_total_entropy": in_total.mean().item(),
+            "mean_in_aleatoric_entropy": in_aleatoric.mean().item(),
+            "mean_in_epistemic_entropy": in_epistemic.mean().item(),
+            "mean_ood_total_entropy": ood_total.mean().item(),
+            "mean_ood_aleatoric_entropy": ood_aleatoric.mean().item(),
+            "mean_ood_epistemic_entropy": ood_epistemic.mean().item(),
+        }
     
     def _save_run(self, run_dir, method, temperature, replicate, metrics, history, training_time, step2_accuracy=None):
         results = {

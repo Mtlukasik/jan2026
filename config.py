@@ -85,11 +85,11 @@ class SVGDConfig:
     n_particles: int = 20           # Number of particles in ensemble
     svgd_lr: float = 1e-3           # Learning rate for SVGD updates
     feature_lr: float = 1e-4        # Learning rate for feature extractor (Phase 2/Step 3)
-    prior_std: float = 1.0          # Prior standard deviation
+    prior_std: float = 1.0          # Prior standard deviation (used for both Laplace and Gaussian)
+    prior_type: str = "laplace"     # Prior type: "laplace" or "gaussian"
     bandwidth_scale: float = 1.0    # Kernel bandwidth scaling factor
     num_epochs: int = 200           # Total training epochs (Phase 1/Step 2)
     phase2_epochs: int = 50         # Joint training epochs (Phase 2/Step 3), 0 to skip
-    use_laplace_prior: bool = True  # Use Laplace prior (vs Gaussian)
     weight_decay: float = 5e-4      # Weight decay for feature optimizer (Phase 2)
     grad_clip: float = 1.0          # Gradient clipping norm
     init_std: float = 0.01          # Std for particle initialization perturbation
