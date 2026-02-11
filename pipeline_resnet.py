@@ -366,7 +366,9 @@ class DeterministicResNetTrainer:
 class BayesianLastLayerTrainer:
     """Train Bayesian last layers using pretrained ResNet features."""
     
-    RUN_NAME_TEMPLATE = "last_layer_{method}_T{temperature}_replicate_{replicate}"
+    # Template now includes prior for SVGD runs
+    RUN_NAME_TEMPLATE_SVGD = "last_layer_svgd_{prior}_T{temperature}_replicate_{replicate}"
+    RUN_NAME_TEMPLATE_MFVI = "last_layer_mfvi_T{temperature}_replicate_{replicate}"
     
     def __init__(self, config: ExperimentConfig, save_dir: str, device: str = None):
         self.config = config
@@ -408,30 +410,47 @@ class BayesianLastLayerTrainer:
         return completed
     
     @staticmethod
-    def get_run_name(method: str, temperature: float, replicate: int) -> str:
-        return BayesianLastLayerTrainer.RUN_NAME_TEMPLATE.format(
-            method=method, temperature=temperature, replicate=replicate + 1
-        )
+    def get_run_name(method: str, temperature: float, replicate: int, prior_type: str = None) -> str:
+        """Get run name. For SVGD, prior_type is required."""
+        if method == "svgd":
+            if prior_type is None:
+                prior_type = "laplace"  # Default for backward compatibility
+            return BayesianLastLayerTrainer.RUN_NAME_TEMPLATE_SVGD.format(
+                prior=prior_type, temperature=temperature, replicate=replicate + 1
+            )
+        else:  # mfvi
+            return BayesianLastLayerTrainer.RUN_NAME_TEMPLATE_MFVI.format(
+                temperature=temperature, replicate=replicate + 1
+            )
     
-    def _get_run_dir(self, method: str, temperature: float, replicate: int) -> str:
-        return os.path.join(self.save_dir, self.get_run_name(method, temperature, replicate))
+    def _get_run_dir(self, method: str, temperature: float, replicate: int, prior_type: str = None) -> str:
+        return os.path.join(self.save_dir, self.get_run_name(method, temperature, replicate, prior_type))
     
-    def _is_completed(self, method: str, temperature: float, replicate: int) -> bool:
-        run_name = self.get_run_name(method, temperature, replicate)
+    def _is_completed(self, method: str, temperature: float, replicate: int, prior_type: str = None) -> bool:
+        run_name = self.get_run_name(method, temperature, replicate, prior_type)
         return run_name in self.completed_runs
     
-    def get_pending(self, methods=["svgd", "mfvi"], temperatures=None, num_replicates=None):
+    def get_pending(self, methods=["svgd", "mfvi"], temperatures=None, num_replicates=None, prior_types=None):
         if temperatures is None:
             temperatures = self.config.temperature.temperatures
         if num_replicates is None:
             num_replicates = self.config.num_replicates
+        if prior_types is None:
+            prior_types = self.config.svgd.prior_types
         
         pending = []
         for method in methods:
-            for temp in temperatures:
-                for rep in range(num_replicates):
-                    if not self._is_completed(method, temp, rep):
-                        pending.append((method, temp, rep))
+            if method == "svgd":
+                for prior in prior_types:
+                    for temp in temperatures:
+                        for rep in range(num_replicates):
+                            if not self._is_completed(method, temp, rep, prior):
+                                pending.append((method, temp, rep, prior))
+            else:  # mfvi - no prior type
+                for temp in temperatures:
+                    for rep in range(num_replicates):
+                        if not self._is_completed(method, temp, rep):
+                            pending.append((method, temp, rep, None))
         return pending
     
     def train_all(
@@ -440,21 +459,29 @@ class BayesianLastLayerTrainer:
         temperatures=None,
         num_replicates=None,
         svgd_epochs=100,
-        mfvi_epochs=200
+        mfvi_epochs=200,
+        prior_types=None
     ):
         """Train all pending Bayesian models."""
         if temperatures is None:
             temperatures = self.config.temperature.temperatures
         if num_replicates is None:
             num_replicates = self.config.num_replicates
+        if prior_types is None:
+            prior_types = self.config.svgd.prior_types
         
-        pending = self.get_pending(methods, temperatures, num_replicates)
-        total = len(methods) * len(temperatures) * num_replicates
+        pending = self.get_pending(methods, temperatures, num_replicates, prior_types)
+        
+        # Calculate total: SVGD has prior_types dimension, MFVI doesn't
+        n_svgd = len(prior_types) * len(temperatures) * num_replicates if "svgd" in methods else 0
+        n_mfvi = len(temperatures) * num_replicates if "mfvi" in methods else 0
+        total = n_svgd + n_mfvi
         
         print("=" * 70)
         print("STEP 2: Training Bayesian Last Layers")
         print("=" * 70)
         print(f"Pretrained features from: {self.deterministic_dir}")
+        print(f"Prior types for SVGD: {prior_types}")
         print(f"Total: {total}, Completed: {total - len(pending)}, Pending: {len(pending)}")
         print("=" * 70)
         
@@ -462,14 +489,14 @@ class BayesianLastLayerTrainer:
             print("✓ All Bayesian models already trained!")
             return
         
-        for i, (method, temp, rep) in enumerate(pending):
+        for i, (method, temp, rep, prior) in enumerate(pending):
             print(f"\n[{i+1}/{len(pending)}]")
             if method == "svgd":
-                self._train_svgd(temp, rep, svgd_epochs)
+                self._train_svgd(temp, rep, svgd_epochs, prior_type=prior)
             else:
                 self._train_mfvi(temp, rep, mfvi_epochs)
     
-    def _train_svgd(self, temperature: float, replicate: int, num_epochs: int):
+    def _train_svgd(self, temperature: float, replicate: int, num_epochs: int, prior_type: str = "laplace"):
         """
         Train SVGD with frozen ResNet features.
         
@@ -484,9 +511,12 @@ class BayesianLastLayerTrainer:
             For each particle θᵢ:
             θᵢ ← θᵢ + ε · (1/n) Σⱼ [k(θⱼ,θᵢ)·∇log p(θⱼ|D) + ∇k(θⱼ,θᵢ)]
                                     \_____attractive______/   \_repulsive_/
+        
+        Args:
+            prior_type: "laplace" or "gaussian"
         """
-        run_name = self.get_run_name("svgd", temperature, replicate)
-        run_dir = self._get_run_dir("svgd", temperature, replicate)
+        run_name = self.get_run_name("svgd", temperature, replicate, prior_type)
+        run_dir = self._get_run_dir("svgd", temperature, replicate, prior_type)
         os.makedirs(run_dir, exist_ok=True)
         
         print(f"\n{'='*60}")
@@ -575,7 +605,7 @@ class BayesianLastLayerTrainer:
             Laplace: -|θ|/σ  (encourages sparsity)
             Gaussian: -θ²/(2σ²)  (L2 regularization)
             """
-            if self.config.svgd.prior_type == "laplace":
+            if prior_type == "laplace":
                 return -torch.sum(torch.abs(params)) / self.config.svgd.prior_std
             else:  # gaussian
                 return -0.5 * torch.sum(params ** 2) / (self.config.svgd.prior_std ** 2)
@@ -684,7 +714,7 @@ class BayesianLastLayerTrainer:
         # Compute final metrics
         metrics = self._compute_svgd_metrics_particles(feature_extractor, particles)
         
-        self._save_run(run_dir, "svgd", temperature, replicate, metrics, history, training_time)
+        self._save_run(run_dir, "svgd", temperature, replicate, metrics, history, training_time, prior_type=prior_type)
         self._plot_curves(history, run_name, run_dir, "svgd")
         self._mark_completed(run_dir)
         
@@ -1091,16 +1121,22 @@ class BayesianLastLayerTrainer:
             "mean_ood_epistemic_entropy": ood_epistemic.mean().item(),
         }
     
-    def _save_run(self, run_dir, method, temperature, replicate, metrics, history, training_time):
+    def _save_run(self, run_dir, method, temperature, replicate, metrics, history, training_time, prior_type=None):
+        results = {
+            "method": method, "temperature": temperature, "replicate": replicate + 1,
+            "metrics": metrics, "training_time": training_time,
+            "training_history": history, "timestamp": datetime.now().isoformat()
+        }
+        if prior_type is not None:
+            results["prior_type"] = prior_type
+        
         with open(os.path.join(run_dir, "results.json"), 'w') as f:
-            json.dump({
-                "method": method, "temperature": temperature, "replicate": replicate + 1,
-                "metrics": metrics, "training_time": training_time,
-                "training_history": history, "timestamp": datetime.now().isoformat()
-            }, f, indent=2)
+            json.dump(results, f, indent=2)
         
         hyperparams = asdict(self.config.svgd if method == "svgd" else self.config.mfvi)
         hyperparams["temperature"] = temperature
+        if prior_type is not None:
+            hyperparams["prior_type"] = prior_type
         with open(os.path.join(run_dir, "hyperparameters.json"), 'w') as f:
             json.dump(hyperparams, f, indent=2)
     
@@ -2032,29 +2068,51 @@ def print_status(save_dir: str, config: ExperimentConfig):
 # Main
 # =============================================================================
 
-def parse_run_name(name: str) -> Optional[Tuple[str, float, int]]:
+def parse_run_name(name: str) -> Optional[Tuple[str, float, int, Optional[str]]]:
     """
-    Parse run name to extract method, temperature, and replicate.
+    Parse run name to extract method, temperature, replicate, and prior_type.
     
     Examples:
-        "last_layer_svgd_T0.001_replicate_1" -> ("svgd", 0.001, 0)
-        "last_layer_mfvi_T0.1_replicate_2" -> ("mfvi", 0.1, 1)
-        "joint_svgd_T0.03_replicate_3" -> ("svgd", 0.03, 2)
+        "last_layer_svgd_laplace_T0.001_replicate_1" -> ("svgd", 0.001, 0, "laplace")
+        "last_layer_svgd_gaussian_T0.1_replicate_2" -> ("svgd", 0.1, 1, "gaussian")
+        "last_layer_mfvi_T0.1_replicate_2" -> ("mfvi", 0.1, 1, None)
+        "joint_svgd_laplace_T0.03_replicate_3" -> ("svgd", 0.03, 2, "laplace")
+        
+        # Backward compatible (old format without prior)
+        "last_layer_svgd_T0.001_replicate_1" -> ("svgd", 0.001, 0, "laplace")
     
     Returns:
-        Tuple of (method, temperature, replicate_index) or None if invalid
+        Tuple of (method, temperature, replicate_index, prior_type) or None if invalid
     """
     import re
     
-    # Pattern for last_layer_ or joint_
-    pattern = r"(?:last_layer_|joint_)(svgd|mfvi)_T([0-9.]+)_replicate_(\d+)"
-    match = re.match(pattern, name)
+    # Pattern with prior type (new format)
+    pattern_with_prior = r"(?:last_layer_|joint_)svgd_(laplace|gaussian)_T([0-9.]+)_replicate_(\d+)"
+    match = re.match(pattern_with_prior, name)
     
     if match:
-        method = match.group(1)
+        prior_type = match.group(1)
         temperature = float(match.group(2))
-        replicate = int(match.group(3)) - 1  # Convert to 0-indexed
-        return method, temperature, replicate
+        replicate = int(match.group(3)) - 1
+        return "svgd", temperature, replicate, prior_type
+    
+    # Pattern for MFVI (no prior type)
+    pattern_mfvi = r"(?:last_layer_|joint_)mfvi_T([0-9.]+)_replicate_(\d+)"
+    match = re.match(pattern_mfvi, name)
+    
+    if match:
+        temperature = float(match.group(1))
+        replicate = int(match.group(2)) - 1
+        return "mfvi", temperature, replicate, None
+    
+    # Backward compatible: old SVGD format without prior (assume laplace)
+    pattern_old_svgd = r"(?:last_layer_|joint_)svgd_T([0-9.]+)_replicate_(\d+)"
+    match = re.match(pattern_old_svgd, name)
+    
+    if match:
+        temperature = float(match.group(1))
+        replicate = int(match.group(2)) - 1
+        return "svgd", temperature, replicate, "laplace"  # Default to laplace
     
     return None
 
@@ -2069,7 +2127,7 @@ Examples:
     python pipeline_resnet.py --step 2 --save-dir ./results
     
     # Run a single model by name
-    python pipeline_resnet.py --step 2 --save-dir ./results --name last_layer_svgd_T0.001_replicate_1
+    python pipeline_resnet.py --step 2 --save-dir ./results --name last_layer_svgd_laplace_T0.001_replicate_1
     
     # Run Step 3 for a single model
     python pipeline_resnet.py --step 3 --save-dir ./results --name joint_mfvi_T0.1_replicate_2
@@ -2084,7 +2142,7 @@ Examples:
     parser.add_argument("--joint-svgd-epochs", type=int, default=50, help="Epochs for Step 3 SVGD")
     parser.add_argument("--joint-mfvi-epochs", type=int, default=100, help="Epochs for Step 3 MFVI")
     parser.add_argument("--name", type=str, default=None, 
-                        help="Run a single model by name (e.g., last_layer_svgd_T0.001_replicate_1)")
+                        help="Run a single model by name (e.g., last_layer_svgd_laplace_T0.001_replicate_1)")
     parser.add_argument("--force", action="store_true",
                         help="Force re-run even if model already exists")
     
@@ -2128,17 +2186,22 @@ Examples:
             parsed = parse_run_name(args.name)
             if parsed is None:
                 print(f"ERROR: Invalid run name format: {args.name}")
-                print("Expected format: last_layer_{{svgd|mfvi}}_T{{temperature}}_replicate_{{n}}")
-                print("Example: last_layer_svgd_T0.001_replicate_1")
+                print("Expected formats:")
+                print("  SVGD: last_layer_svgd_{{laplace|gaussian}}_T{{temperature}}_replicate_{{n}}")
+                print("  MFVI: last_layer_mfvi_T{{temperature}}_replicate_{{n}}")
+                print("Examples:")
+                print("  last_layer_svgd_laplace_T0.001_replicate_1")
+                print("  last_layer_svgd_gaussian_T0.1_replicate_2")
+                print("  last_layer_mfvi_T0.1_replicate_1")
                 return
             
-            method, temperature, replicate = parsed
+            method, temperature, replicate, prior_type = parsed
             
             # Check if already exists
-            if trainer._is_completed(method, temperature, replicate) and not args.force:
+            if trainer._is_completed(method, temperature, replicate, prior_type) and not args.force:
                 print(f"ERROR: Model already exists: {args.name}")
                 print(f"Use --force to re-run, or delete the folder:")
-                print(f"  rm -rf {trainer._get_run_dir(method, temperature, replicate)}")
+                print(f"  rm -rf {trainer._get_run_dir(method, temperature, replicate, prior_type)}")
                 return
             
             # If force, remove the COMPLETED marker
@@ -2152,11 +2215,13 @@ Examples:
             # Run single model
             print(f"Running single model: {args.name}")
             print(f"  Method: {method}, Temperature: {temperature}, Replicate: {replicate + 1}")
+            if prior_type:
+                print(f"  Prior: {prior_type}")
             
             epochs = args.svgd_epochs if method == "svgd" else args.mfvi_epochs
             
             if method == "svgd":
-                trainer._train_svgd(temperature, replicate, epochs)
+                trainer._train_svgd(temperature, replicate, epochs, prior_type=prior_type)
             else:
                 trainer._train_mfvi(temperature, replicate, epochs)
         else:
@@ -2174,7 +2239,9 @@ Examples:
             parsed = parse_run_name(args.name)
             if parsed is None:
                 print(f"ERROR: Invalid run name format: {args.name}")
-                print("Expected format: joint_{{svgd|mfvi}}_T{{temperature}}_replicate_{{n}}")
+                print("Expected formats:")
+                print("  SVGD: joint_svgd_{{laplace|gaussian}}_T{{temperature}}_replicate_{{n}}")
+                print("  MFVI: joint_mfvi_T{{temperature}}_replicate_{{n}}")
                 print("Example: joint_svgd_T0.001_replicate_1")
                 return
             
