@@ -1,5 +1,5 @@
 # SVGD vs MFVI Deep learning Last Layer Bayesian Inference Comparison
-
+<img width="2084" height="1767" alt="comparison_grid" src="https://github.com/user-attachments/assets/de5f6a62-47d7-43a8-b321-a52414f00f39" />
 This project implements a comparison of **Stein Variational** and **MFVI (Mean-Field Variational Inference)** for last-layer Bayesian inference on CIFAR-10, following the methodology in:
 
 > **"Bayesian Neural Network Priors Revisited"**  
