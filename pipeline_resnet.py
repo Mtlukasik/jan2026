@@ -714,12 +714,26 @@ class BayesianLastLayerTrainer:
         # Compute final metrics
         metrics = self._compute_svgd_metrics_particles(feature_extractor, particles)
         
+        # Save particles for later analysis
+        particles_state = [p.state_dict() for p in particles]
+        torch.save(particles_state, os.path.join(run_dir, "particles.pt"))
+        
         self._save_run(run_dir, "svgd", temperature, replicate, metrics, history, training_time, prior_type=prior_type)
         self._plot_curves(history, run_name, run_dir, "svgd")
         self._mark_completed(run_dir)
         
         print(f"Results: Error={metrics['error']:.4f}, NLL={metrics['nll']:.4f}, "
-              f"ECE={metrics['ece']:.4f}, OOD AUROC={metrics['ood_auroc']:.4f}")
+              f"ECE={metrics['ece']:.4f}")
+        print(f"Entropy Decomposition:")
+        print(f"  In-dist:  Aleatoric={metrics['mean_in_aleatoric_entropy']:.4f}, "
+              f"Epistemic={metrics['mean_in_epistemic_entropy']:.4f}, "
+              f"Total={metrics['mean_in_total_entropy']:.4f}")
+        print(f"  OOD:      Aleatoric={metrics['mean_ood_aleatoric_entropy']:.4f}, "
+              f"Epistemic={metrics['mean_ood_epistemic_entropy']:.4f}, "
+              f"Total={metrics['mean_ood_total_entropy']:.4f}")
+        print(f"  AUROC:    Aleatoric={metrics['ood_auroc_aleatoric']:.4f}, "
+              f"Epistemic={metrics['ood_auroc_epistemic']:.4f}, "
+              f"Total={metrics['ood_auroc_total']:.4f}")
         print(f"✓ {run_name} COMPLETED ({training_time:.1f}s)")
     
     def _eval_svgd_particles(self, feature_extractor, particles) -> float:
@@ -970,12 +984,25 @@ class BayesianLastLayerTrainer:
         training_time = time.time() - start_time
         metrics = self._compute_mfvi_metrics(model)
         
+        # Save MFVI layer for later analysis
+        torch.save(model.last_layer.state_dict(), os.path.join(run_dir, "mfvi_layer.pt"))
+        
         self._save_run(run_dir, "mfvi", temperature, replicate, metrics, history, training_time)
         self._plot_curves(history, run_name, run_dir, "mfvi")
         self._mark_completed(run_dir)
         
         print(f"Results: Error={metrics['error']:.4f}, NLL={metrics['nll']:.4f}, "
-              f"ECE={metrics['ece']:.4f}, OOD AUROC={metrics['ood_auroc']:.4f}")
+              f"ECE={metrics['ece']:.4f}")
+        print(f"Entropy Decomposition:")
+        print(f"  In-dist:  Aleatoric={metrics['mean_in_aleatoric_entropy']:.4f}, "
+              f"Epistemic={metrics['mean_in_epistemic_entropy']:.4f}, "
+              f"Total={metrics['mean_in_total_entropy']:.4f}")
+        print(f"  OOD:      Aleatoric={metrics['mean_ood_aleatoric_entropy']:.4f}, "
+              f"Epistemic={metrics['mean_ood_epistemic_entropy']:.4f}, "
+              f"Total={metrics['mean_ood_total_entropy']:.4f}")
+        print(f"  AUROC:    Aleatoric={metrics['ood_auroc_aleatoric']:.4f}, "
+              f"Epistemic={metrics['ood_auroc_epistemic']:.4f}, "
+              f"Total={metrics['ood_auroc_total']:.4f}")
         print(f"✓ {run_name} COMPLETED ({training_time:.1f}s)")
     
     def _eval_mfvi(self, model) -> float:
@@ -1570,6 +1597,11 @@ class JointTrainer:
         feature_extractor.eval()
         metrics = self._compute_joint_svgd_metrics(feature_extractor, particles)
         
+        # Save particles and feature extractor for later analysis
+        particles_state = [p.state_dict() for p in particles]
+        torch.save(particles_state, os.path.join(run_dir, "particles.pt"))
+        torch.save(feature_extractor.state_dict(), os.path.join(run_dir, "feature_extractor.pt"))
+        
         # Save
         self._save_run(run_dir, "svgd", temperature, replicate, metrics, history, training_time, 
                       step2_accuracy=step2_results['metrics'].get('accuracy', 1 - step2_results['metrics']['error']))
@@ -1687,6 +1719,10 @@ class JointTrainer:
         training_time = time.time() - start_time
         metrics = self._compute_mfvi_metrics(model)
         metrics['accuracy'] = 1 - metrics['error']
+        
+        # Save MFVI layer and feature extractor for later analysis
+        torch.save(model.last_layer.state_dict(), os.path.join(run_dir, "mfvi_layer.pt"))
+        torch.save(model.feature_extractor.state_dict(), os.path.join(run_dir, "feature_extractor.pt"))
         
         self._save_run(run_dir, "mfvi", temperature, replicate, metrics, history, training_time,
                       step2_accuracy=step2_results['metrics'].get('accuracy', 1 - step2_results['metrics']['error']))
