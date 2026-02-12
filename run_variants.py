@@ -338,10 +338,13 @@ class VariantTrainer:
         
         num_epochs = num_epochs or variant.step2_epochs
         
-        # Create model
+        # Create model with MFVI last layer
+        # prior_log_var = log(prior_std^2) = 2 * log(prior_std)
+        prior_log_var = 2 * np.log(variant.prior_std)
         model = ResNetForBayesianLastLayer(
-            feature_extractor=ResNetFeatureExtractor(),
-            bayesian_layer=BayesianLastLayerMFVI(512, 10, prior_log_var=2*np.log(variant.prior_std))
+            num_classes=10,
+            last_layer_type="mfvi",
+            prior_log_var=prior_log_var
         ).to(self.device)
         
         # Load pretrained features
