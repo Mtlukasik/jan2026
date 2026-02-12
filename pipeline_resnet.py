@@ -595,7 +595,7 @@ class BayesianLastLayerTrainer:
         SVGD Update:
             For each particle θᵢ:
             θᵢ ← θᵢ + ε · (1/n) Σⱼ [k(θⱼ,θᵢ)·∇log p(θⱼ|D) + ∇k(θⱼ,θᵢ)]
-                                    \_____attractive______/   \_repulsive_/
+                                    |_____attractive______|   |_repulsive_|
         
         Args:
             prior_type: "laplace" or "gaussian"
@@ -2233,51 +2233,61 @@ def print_status(save_dir: str, config: ExperimentConfig):
 # Main
 # =============================================================================
 
-def parse_run_name(name: str) -> Optional[Tuple[str, float, int, Optional[str]]]:
+def parse_run_name(name: str) -> Optional[Tuple[str, float, int, Optional[str], Optional[str]]]:
     """
-    Parse run name to extract method, temperature, replicate, and prior_type.
+    Parse run name to extract method, temperature, replicate, prior_type, and variant_name.
     
     Examples:
-        "last_layer_svgd_laplace_T0.001_replicate_1" -> ("svgd", 0.001, 0, "laplace")
-        "last_layer_svgd_gaussian_T0.1_replicate_2" -> ("svgd", 0.1, 1, "gaussian")
-        "last_layer_mfvi_T0.1_replicate_2" -> ("mfvi", 0.1, 1, None)
-        "joint_svgd_laplace_T0.03_replicate_3" -> ("svgd", 0.03, 2, "laplace")
+        # Variant format (new)
+        "last_layer_svgd_laplace_std1_T0.1_replicate_1" -> ("svgd", 0.1, 0, "laplace", "svgd_laplace_std1")
+        "last_layer_mfvi_std0.5_T0.1_replicate_2" -> ("mfvi", 0.1, 1, None, "mfvi_std0.5")
         
-        # Backward compatible (old format without prior)
-        "last_layer_svgd_T0.001_replicate_1" -> ("svgd", 0.001, 0, "laplace")
+        # Old format (still supported)
+        "last_layer_svgd_laplace_T0.001_replicate_1" -> ("svgd", 0.001, 0, "laplace", None)
+        "last_layer_mfvi_T0.1_replicate_2" -> ("mfvi", 0.1, 1, None, None)
     
     Returns:
-        Tuple of (method, temperature, replicate_index, prior_type) or None if invalid
+        Tuple of (method, temperature, replicate_index, prior_type, variant_name) or None if invalid
     """
     import re
     
-    # Pattern with prior type (new format)
-    pattern_with_prior = r"(?:last_layer_|joint_)svgd_(laplace|gaussian)_T([0-9.]+)_replicate_(\d+)"
-    match = re.match(pattern_with_prior, name)
+    # Pattern: last_layer_{variant_name}_T{temp}_replicate_{n}
+    # variant_name can be: svgd_laplace_std1, svgd_gauss_std0.5, mfvi_std1, svgd_laplace, mfvi, etc.
+    pattern = r"(?:last_layer_|joint_)(.+)_T([0-9.]+)_replicate_(\d+)"
+    match = re.match(pattern, name)
     
-    if match:
-        prior_type = match.group(1)
-        temperature = float(match.group(2))
-        replicate = int(match.group(3)) - 1
-        return "svgd", temperature, replicate, prior_type
+    if not match:
+        return None
     
-    # Pattern for MFVI (no prior type)
-    pattern_mfvi = r"(?:last_layer_|joint_)mfvi_T([0-9.]+)_replicate_(\d+)"
-    match = re.match(pattern_mfvi, name)
+    variant_name = match.group(1)
+    temperature = float(match.group(2))
+    replicate = int(match.group(3)) - 1
     
-    if match:
-        temperature = float(match.group(1))
-        replicate = int(match.group(2)) - 1
-        return "mfvi", temperature, replicate, None
-    
-    # Backward compatible: old SVGD format without prior (assume laplace)
-    pattern_old_svgd = r"(?:last_layer_|joint_)svgd_T([0-9.]+)_replicate_(\d+)"
-    match = re.match(pattern_old_svgd, name)
-    
-    if match:
-        temperature = float(match.group(1))
-        replicate = int(match.group(2)) - 1
-        return "svgd", temperature, replicate, "laplace"  # Default to laplace
+    # Determine method and prior_type from variant_name
+    if variant_name.startswith("svgd"):
+        method = "svgd"
+        if "laplace" in variant_name:
+            prior_type = "laplace"
+        elif "gauss" in variant_name:
+            prior_type = "gaussian"
+        else:
+            prior_type = "laplace"  # default
+        
+        # Check if it's old format (just "svgd_laplace" or "svgd_gaussian")
+        if variant_name in ("svgd_laplace", "svgd_gaussian"):
+            return method, temperature, replicate, prior_type, None
+        else:
+            return method, temperature, replicate, prior_type, variant_name
+            
+    elif variant_name.startswith("mfvi"):
+        method = "mfvi"
+        prior_type = None
+        
+        # Check if it's old format (just "mfvi")
+        if variant_name == "mfvi":
+            return method, temperature, replicate, None, None
+        else:
+            return method, temperature, replicate, None, variant_name
     
     return None
 
@@ -2368,23 +2378,30 @@ Examples:
                 print("  SVGD: last_layer_svgd_{{laplace|gaussian}}_T{{temperature}}_replicate_{{n}}")
                 print("  MFVI: last_layer_mfvi_T{{temperature}}_replicate_{{n}}")
                 print("Examples:")
-                print("  last_layer_svgd_laplace_T0.001_replicate_1")
-                print("  last_layer_svgd_gaussian_T0.1_replicate_2")
-                print("  last_layer_mfvi_T0.1_replicate_1")
+                print("  last_layer_svgd_laplace_std1_T0.1_replicate_1")
+                print("  last_layer_mfvi_std1_T0.1_replicate_1")
+                print("  last_layer_svgd_laplace_T0.001_replicate_1  (old format)")
                 return
             
-            method, temperature, replicate, prior_type = parsed
+            method, temperature, replicate, prior_type, variant_name = parsed
+            
+            # Determine run directory
+            if variant_name:
+                run_name = f"last_layer_{variant_name}_T{temperature}_replicate_{replicate + 1}"
+                run_dir = os.path.join(args.save_dir, run_name)
+            else:
+                run_dir = trainer._get_run_dir(method, temperature, replicate, prior_type)
+                run_name = os.path.basename(run_dir)
             
             # Check if already exists
-            if trainer._is_completed(method, temperature, replicate, prior_type) and not args.force:
+            if os.path.exists(os.path.join(run_dir, "COMPLETED")) and not args.force:
                 print(f"ERROR: Model already exists: {args.name}")
                 print(f"Use --force to re-run, or delete the folder:")
-                print(f"  rm -rf {trainer._get_run_dir(method, temperature, replicate, prior_type)}")
+                print(f"  rm -rf {run_dir}")
                 return
             
             # If force, remove the COMPLETED marker
             if args.force:
-                run_dir = trainer._get_run_dir(method, temperature, replicate)
                 completed_path = os.path.join(run_dir, "COMPLETED")
                 if os.path.exists(completed_path):
                     os.remove(completed_path)
@@ -2395,13 +2412,37 @@ Examples:
             print(f"  Method: {method}, Temperature: {temperature}, Replicate: {replicate + 1}")
             if prior_type:
                 print(f"  Prior: {prior_type}")
+            if variant_name:
+                print(f"  Variant: {variant_name}")
             
             epochs = args.svgd_epochs if method == "svgd" else args.mfvi_epochs
             
             if method == "svgd":
-                trainer._train_svgd(temperature, replicate, epochs, prior_type=prior_type)
+                # If variant_name, extract prior_std from variant config
+                if variant_name and HAS_VARIANTS:
+                    variant = get_variant(variant_name)
+                    if variant:
+                        trainer._train_svgd(temperature, replicate, epochs, 
+                                          prior_type=variant.get("prior_type", "laplace"),
+                                          prior_std=variant.get("prior_std", 1.0),
+                                          n_particles=variant.get("n_particles", 20),
+                                          variant_name=variant_name)
+                    else:
+                        trainer._train_svgd(temperature, replicate, epochs, prior_type=prior_type,
+                                          variant_name=variant_name)
+                else:
+                    trainer._train_svgd(temperature, replicate, epochs, prior_type=prior_type)
             else:
-                trainer._train_mfvi(temperature, replicate, epochs)
+                if variant_name and HAS_VARIANTS:
+                    variant = get_variant(variant_name)
+                    if variant:
+                        trainer._train_mfvi(temperature, replicate, epochs,
+                                          prior_std=variant.get("prior_std", 1.0),
+                                          variant_name=variant_name)
+                    else:
+                        trainer._train_mfvi(temperature, replicate, epochs, variant_name=variant_name)
+                else:
+                    trainer._train_mfvi(temperature, replicate, epochs)
         else:
             # Run all pending
             if args.variants:
