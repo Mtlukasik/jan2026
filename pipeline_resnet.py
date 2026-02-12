@@ -51,6 +51,14 @@ from config import ExperimentConfig, DEVICE, SEED
 from data_loading_resnet import DataLoaderManager
 from resnet import ResNetForBayesianLastLayer, ResNetFeatureExtractor
 
+# Import model variants (optional - for variant-based training)
+try:
+    from model_variants import MODEL_VARIANTS, get_variant, get_variant_names, get_active_variants
+    HAS_VARIANTS = True
+except ImportError:
+    HAS_VARIANTS = False
+    MODEL_VARIANTS = []
+
 
 # =============================================================================
 # STEP 1: Deterministic ResNet Training
@@ -496,7 +504,84 @@ class BayesianLastLayerTrainer:
             else:
                 self._train_mfvi(temp, rep, mfvi_epochs)
     
-    def _train_svgd(self, temperature: float, replicate: int, num_epochs: int, prior_type: str = "laplace"):
+    def train_variants(
+        self,
+        variants: list = None,
+        temperatures: list = None,
+        num_replicates: int = None,
+        svgd_epochs: int = 100,
+        mfvi_epochs: int = 200
+    ):
+        """
+        Train models using variant configurations from model_variants.py.
+        
+        Each variant specifies: name, method, prior_type, prior_std, n_particles
+        
+        Usage:
+            trainer.train_variants()  # Train all variants
+            trainer.train_variants(variants=[get_variant("svgd_laplace_std1")])  # Specific variant
+        """
+        if not HAS_VARIANTS:
+            print("ERROR: model_variants.py not found. Cannot use train_variants().")
+            print("Use train_all() instead, or create model_variants.py")
+            return
+        
+        if variants is None:
+            variants = get_active_variants()
+        if temperatures is None:
+            temperatures = self.config.temperature.temperatures
+        if num_replicates is None:
+            num_replicates = self.config.num_replicates
+        
+        # Build list of pending runs
+        pending = []
+        for variant in variants:
+            for temp in temperatures:
+                for rep in range(num_replicates):
+                    run_name = f"last_layer_{variant['name']}_T{temp}_replicate_{rep + 1}"
+                    if not os.path.exists(os.path.join(self.save_dir, run_name, "COMPLETED")):
+                        pending.append((variant, temp, rep))
+        
+        total = len(variants) * len(temperatures) * num_replicates
+        
+        print("=" * 70)
+        print("STEP 2: Training Model Variants")
+        print("=" * 70)
+        print(f"Variants: {[v['name'] for v in variants]}")
+        print(f"Temperatures: {temperatures}")
+        print(f"Replicates: {num_replicates}")
+        print(f"Total: {total}, Completed: {total - len(pending)}, Pending: {len(pending)}")
+        print("=" * 70)
+        
+        if len(pending) == 0:
+            print("✓ All variants already trained!")
+            return
+        
+        for i, (variant, temp, rep) in enumerate(pending):
+            print(f"\n[{i+1}/{len(pending)}] Variant: {variant['name']}")
+            
+            if variant["method"] == "svgd":
+                self._train_svgd(
+                    temperature=temp,
+                    replicate=rep,
+                    num_epochs=svgd_epochs,
+                    prior_type=variant.get("prior_type", "laplace"),
+                    prior_std=variant.get("prior_std", 1.0),
+                    n_particles=variant.get("n_particles", 20),
+                    variant_name=variant["name"]
+                )
+            else:  # mfvi
+                self._train_mfvi(
+                    temperature=temp,
+                    replicate=rep,
+                    num_epochs=mfvi_epochs,
+                    prior_std=variant.get("prior_std", 1.0),
+                    variant_name=variant["name"]
+                )
+    
+    def _train_svgd(self, temperature: float, replicate: int, num_epochs: int, 
+                    prior_type: str = "laplace", prior_std: float = None, n_particles: int = None,
+                    variant_name: str = None):
         """
         Train SVGD with frozen ResNet features.
         
@@ -514,13 +599,27 @@ class BayesianLastLayerTrainer:
         
         Args:
             prior_type: "laplace" or "gaussian"
+            prior_std: prior standard deviation (default: from config)
+            n_particles: number of particles (default: from config)
+            variant_name: optional name for the variant (used in folder name)
         """
-        run_name = self.get_run_name("svgd", temperature, replicate, prior_type)
-        run_dir = self._get_run_dir("svgd", temperature, replicate, prior_type)
+        # Use provided values or fall back to config defaults
+        prior_std = prior_std if prior_std is not None else self.config.svgd.prior_std
+        n_particles = n_particles if n_particles is not None else self.config.svgd.n_particles
+        
+        # Determine run name
+        if variant_name:
+            run_name = f"last_layer_{variant_name}_T{temperature}_replicate_{replicate + 1}"
+            run_dir = os.path.join(self.save_dir, run_name)
+        else:
+            run_name = self.get_run_name("svgd", temperature, replicate, prior_type)
+            run_dir = self._get_run_dir("svgd", temperature, replicate, prior_type)
+        
         os.makedirs(run_dir, exist_ok=True)
         
         print(f"\n{'='*60}")
         print(f"Training: {run_name}")
+        print(f"  Prior: {prior_type}, std={prior_std}, particles={n_particles}")
         print(f"{'='*60}")
         
         torch.manual_seed(SEED + replicate)
@@ -559,7 +658,7 @@ class BayesianLastLayerTrainer:
         # =====================================================================
         # Step 3: Create particles initialized from pretrained last layer
         # =====================================================================
-        n_particles = self.config.svgd.n_particles
+        # n_particles is now a parameter (set at top of function)
         particles = []
         
         for i in range(n_particles):
@@ -606,9 +705,9 @@ class BayesianLastLayerTrainer:
             Gaussian: -θ²/(2σ²)  (L2 regularization)
             """
             if prior_type == "laplace":
-                return -torch.sum(torch.abs(params)) / self.config.svgd.prior_std
+                return -torch.sum(torch.abs(params)) / prior_std
             else:  # gaussian
-                return -0.5 * torch.sum(params ** 2) / (self.config.svgd.prior_std ** 2)
+                return -0.5 * torch.sum(params ** 2) / (prior_std ** 2)
         
         # =====================================================================
         # Training loop
@@ -718,7 +817,9 @@ class BayesianLastLayerTrainer:
         particles_state = [p.state_dict() for p in particles]
         torch.save(particles_state, os.path.join(run_dir, "particles.pt"))
         
-        self._save_run(run_dir, "svgd", temperature, replicate, metrics, history, training_time, prior_type=prior_type)
+        self._save_run(run_dir, "svgd", temperature, replicate, metrics, history, training_time, 
+                      prior_type=prior_type, prior_std=prior_std, n_particles=n_particles,
+                      variant_name=variant_name)
         self._plot_curves(history, run_name, run_dir, "svgd")
         self._mark_completed(run_dir)
         
@@ -900,14 +1001,30 @@ class BayesianLastLayerTrainer:
             "mean_ood_epistemic_entropy": ood_epistemic.mean().item(),
         }
     
-    def _train_mfvi(self, temperature: float, replicate: int, num_epochs: int):
+    def _train_mfvi(self, temperature: float, replicate: int, num_epochs: int,
+                    prior_std: float = None, variant_name: str = None):
         """Train MFVI with frozen ResNet features."""
-        run_name = self.get_run_name("mfvi", temperature, replicate)
-        run_dir = self._get_run_dir("mfvi", temperature, replicate)
+        
+        # Use provided values or fall back to config defaults
+        if prior_std is not None:
+            prior_log_var = 2 * np.log(prior_std)  # log(std^2) = 2*log(std)
+        else:
+            prior_log_var = self.config.mfvi.prior_log_var
+            prior_std = np.exp(prior_log_var / 2)  # For logging
+        
+        # Determine run name
+        if variant_name:
+            run_name = f"last_layer_{variant_name}_T{temperature}_replicate_{replicate + 1}"
+            run_dir = os.path.join(self.save_dir, run_name)
+        else:
+            run_name = self.get_run_name("mfvi", temperature, replicate)
+            run_dir = self._get_run_dir("mfvi", temperature, replicate)
+        
         os.makedirs(run_dir, exist_ok=True)
         
         print(f"\n{'='*60}")
         print(f"Training: {run_name}")
+        print(f"  Prior std={prior_std:.4f}")
         print(f"{'='*60}")
         
         torch.manual_seed(SEED + replicate)
@@ -918,7 +1035,7 @@ class BayesianLastLayerTrainer:
         # Create MFVI model
         model = ResNetForBayesianLastLayer(
             num_classes=10, last_layer_type="mfvi",
-            prior_log_var=self.config.mfvi.prior_log_var
+            prior_log_var=prior_log_var
         ).to(self.device)
         
         # Load pretrained feature extractor
@@ -987,7 +1104,8 @@ class BayesianLastLayerTrainer:
         # Save MFVI layer for later analysis
         torch.save(model.last_layer.state_dict(), os.path.join(run_dir, "mfvi_layer.pt"))
         
-        self._save_run(run_dir, "mfvi", temperature, replicate, metrics, history, training_time)
+        self._save_run(run_dir, "mfvi", temperature, replicate, metrics, history, training_time,
+                      prior_std=prior_std, variant_name=variant_name)
         self._plot_curves(history, run_name, run_dir, "mfvi")
         self._mark_completed(run_dir)
         
@@ -1148,7 +1266,8 @@ class BayesianLastLayerTrainer:
             "mean_ood_epistemic_entropy": ood_epistemic.mean().item(),
         }
     
-    def _save_run(self, run_dir, method, temperature, replicate, metrics, history, training_time, prior_type=None):
+    def _save_run(self, run_dir, method, temperature, replicate, metrics, history, training_time, 
+                  prior_type=None, prior_std=None, n_particles=None, variant_name=None):
         results = {
             "method": method, "temperature": temperature, "replicate": replicate + 1,
             "metrics": metrics, "training_time": training_time,
@@ -1156,6 +1275,12 @@ class BayesianLastLayerTrainer:
         }
         if prior_type is not None:
             results["prior_type"] = prior_type
+        if prior_std is not None:
+            results["prior_std"] = prior_std
+        if n_particles is not None:
+            results["n_particles"] = n_particles
+        if variant_name is not None:
+            results["variant_name"] = variant_name
         
         with open(os.path.join(run_dir, "results.json"), 'w') as f:
             json.dump(results, f, indent=2)
@@ -1164,6 +1289,10 @@ class BayesianLastLayerTrainer:
         hyperparams["temperature"] = temperature
         if prior_type is not None:
             hyperparams["prior_type"] = prior_type
+        if prior_std is not None:
+            hyperparams["prior_std"] = prior_std
+        if n_particles is not None:
+            hyperparams["n_particles"] = n_particles
         with open(os.path.join(run_dir, "hyperparameters.json"), 'w') as f:
             json.dump(hyperparams, f, indent=2)
     
@@ -2181,8 +2310,21 @@ Examples:
                         help="Run a single model by name (e.g., last_layer_svgd_laplace_T0.001_replicate_1)")
     parser.add_argument("--force", action="store_true",
                         help="Force re-run even if model already exists")
+    parser.add_argument("--variants", action="store_true",
+                        help="Use model variants from model_variants.py instead of default config")
+    parser.add_argument("--list-variants", action="store_true",
+                        help="List all available model variants")
     
     args = parser.parse_args()
+    
+    # List variants
+    if args.list_variants:
+        if HAS_VARIANTS:
+            from model_variants import print_variants
+            print_variants()
+        else:
+            print("ERROR: model_variants.py not found")
+        return
     
     torch.manual_seed(SEED)
     np.random.seed(SEED)
@@ -2262,7 +2404,10 @@ Examples:
                 trainer._train_mfvi(temperature, replicate, epochs)
         else:
             # Run all pending
-            trainer.train_all(svgd_epochs=args.svgd_epochs, mfvi_epochs=args.mfvi_epochs)
+            if args.variants:
+                trainer.train_variants(svgd_epochs=args.svgd_epochs, mfvi_epochs=args.mfvi_epochs)
+            else:
+                trainer.train_all(svgd_epochs=args.svgd_epochs, mfvi_epochs=args.mfvi_epochs)
     
     # =========================================================================
     # Step 3: Joint training
