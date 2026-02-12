@@ -27,21 +27,21 @@ MODEL_VARIANTS: List[Dict[str, Any]] = [
         "method": "svgd",
         "prior_type": "laplace",
         "prior_std": 1.0,
-        "n_particles": 20,
+        "n_particles": 50,
     },
     {
         "name": "svgd_laplace_std0.5",
         "method": "svgd",
         "prior_type": "laplace",
         "prior_std": 0.5,
-        "n_particles": 20,
+        "n_particles": 50,
     },
     {
         "name": "svgd_laplace_std2",
         "method": "svgd",
         "prior_type": "laplace",
         "prior_std": 2.0,
-        "n_particles": 20,
+        "n_particles": 50,
     },
     
     # =========================================================================
@@ -52,33 +52,23 @@ MODEL_VARIANTS: List[Dict[str, Any]] = [
         "method": "svgd",
         "prior_type": "gaussian",
         "prior_std": 1.0,
-        "n_particles": 20,
+        "n_particles": 50,
     },
     {
         "name": "svgd_gauss_std0.5",
         "method": "svgd",
         "prior_type": "gaussian",
         "prior_std": 0.5,
-        "n_particles": 20,
+        "n_particles": 50,
     },
     {
         "name": "svgd_gauss_std2",
         "method": "svgd",
         "prior_type": "gaussian",
         "prior_std": 2.0,
-        "n_particles": 20,
-    },
-    
-    # =========================================================================
-    # SVGD with more particles
-    # =========================================================================
-    {
-        "name": "svgd_laplace_p50",
-        "method": "svgd",
-        "prior_type": "laplace",
-        "prior_std": 1.0,
         "n_particles": 50,
     },
+
     
     # =========================================================================
     # MFVI variants - varying prior_std
