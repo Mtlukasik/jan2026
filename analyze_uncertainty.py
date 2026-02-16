@@ -57,19 +57,55 @@ def load_deterministic_model(save_dir: str, device: str) -> nn.Module:
     return feature_extractor, last_layer
 
 
-def load_svgd_particles(save_dir: str, prior_type: str, temperature: float, 
-                        replicate: int, device: str) -> Tuple[nn.Module, List[nn.Module]]:
-    """Load SVGD particles."""
-    run_name = f"last_layer_svgd_{prior_type}_T{temperature}_replicate_{replicate}"
+def load_svgd_particles(save_dir: str, variant_name: str = None, temperature: float = 0.1, 
+                        replicate: int = 1, device: str = None,
+                        prior_type: str = None) -> Tuple[nn.Module, List[nn.Module]]:
+    """
+    Load SVGD particles for posterior predictive.
+    
+    Args:
+        save_dir: Directory containing results
+        variant_name: Name from model_variants.py (e.g., "svgd_laplace_std1")
+        temperature: Temperature value (default: 0.1)
+        replicate: Replicate number, 1-indexed (default: 1)
+        device: Device to load to (default: auto-detect cuda/cpu)
+        prior_type: Prior type for old format runs (e.g., "laplace", "gaussian")
+    
+    Returns:
+        feature_extractor, list of particle modules
+    
+    Example:
+        # Using variant name (new format)
+        fe, particles = load_svgd_particles(
+            "./results", variant_name="svgd_laplace_std1", temperature=0.1
+        )
+        
+        # Using prior_type (old format)
+        fe, particles = load_svgd_particles(
+            "./results", prior_type="laplace", temperature=0.1
+        )
+        
+        # Posterior predictive
+        with torch.no_grad():
+            features = fe(images)
+            probs = [F.softmax(p(features), dim=-1) for p in particles]
+            mean_probs = torch.stack(probs).mean(dim=0)  # Averaged prediction
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Determine run name
+    if variant_name:
+        run_name = f"last_layer_{variant_name}_T{temperature}_replicate_{replicate}"
+    elif prior_type:
+        run_name = f"last_layer_svgd_{prior_type}_T{temperature}_replicate_{replicate}"
+    else:
+        raise ValueError("Must provide either variant_name or prior_type")
+    
     run_dir = os.path.join(save_dir, run_name)
     
     if not os.path.exists(run_dir):
-        # Try old format without prior
-        run_name = f"last_layer_svgd_T{temperature}_replicate_{replicate}"
-        run_dir = os.path.join(save_dir, run_name)
-    
-    if not os.path.exists(run_dir):
-        raise FileNotFoundError(f"SVGD run not found: {run_name}")
+        raise FileNotFoundError(f"SVGD run not found: {run_dir}")
     
     # Load feature extractor from deterministic model
     feature_extractor, _ = load_deterministic_model(save_dir, device)
@@ -77,34 +113,64 @@ def load_svgd_particles(save_dir: str, prior_type: str, temperature: float,
     
     # Load particles
     particles_path = os.path.join(run_dir, "particles.pt")
-    if os.path.exists(particles_path):
-        particles_state = torch.load(particles_path, map_location=device)
-        n_particles = len(particles_state)
-    else:
-        # Particles might be saved differently - check for individual files
-        n_particles = 20  # default
-        particles_state = None
+    if not os.path.exists(particles_path):
+        raise FileNotFoundError(f"Particles not found: {particles_path}\nRe-run training to save particles.")
+    
+    particles_state = torch.load(particles_path, map_location=device)
+    n_particles = len(particles_state)
     
     particles = []
     for i in range(n_particles):
         particle = DeterministicLastLayer(512, 10).to(device)
-        if particles_state is not None:
-            particle.load_state_dict(particles_state[i])
-        particles.append(particle)
+        particle.load_state_dict(particles_state[i])
         particle.eval()
+        particles.append(particle)
     
     print(f"Loaded {len(particles)} SVGD particles from {run_name}")
     return feature_extractor, particles
 
 
-def load_mfvi_model(save_dir: str, temperature: float, replicate: int, 
-                    device: str) -> Tuple[nn.Module, nn.Module]:
-    """Load MFVI model."""
-    run_name = f"last_layer_mfvi_T{temperature}_replicate_{replicate}"
+def load_mfvi_model(save_dir: str, variant_name: str = None, temperature: float = 0.1, 
+                    replicate: int = 1, device: str = None) -> Tuple[nn.Module, nn.Module]:
+    """
+    Load MFVI model for posterior predictive.
+    
+    Args:
+        save_dir: Directory containing results
+        variant_name: Name from model_variants.py (e.g., "mfvi_std1") or None for old format
+        temperature: Temperature value (default: 0.1)
+        replicate: Replicate number, 1-indexed (default: 1)
+        device: Device to load to (default: auto-detect cuda/cpu)
+    
+    Returns:
+        feature_extractor, mfvi_layer
+    
+    Example:
+        # Using variant name (new format)
+        fe, mfvi = load_mfvi_model("./results", variant_name="mfvi_std1", temperature=0.1)
+        
+        # Using old format (no variant)
+        fe, mfvi = load_mfvi_model("./results", temperature=0.1)
+        
+        # Posterior predictive (sample multiple times)
+        with torch.no_grad():
+            features = fe(images)
+            samples = [F.softmax(mfvi(features), dim=-1) for _ in range(50)]
+            mean_probs = torch.stack(samples).mean(dim=0)  # Averaged prediction
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Determine run name
+    if variant_name:
+        run_name = f"last_layer_{variant_name}_T{temperature}_replicate_{replicate}"
+    else:
+        run_name = f"last_layer_mfvi_T{temperature}_replicate_{replicate}"
+    
     run_dir = os.path.join(save_dir, run_name)
     
     if not os.path.exists(run_dir):
-        raise FileNotFoundError(f"MFVI run not found: {run_name}")
+        raise FileNotFoundError(f"MFVI run not found: {run_dir}")
     
     # Load feature extractor
     feature_extractor, _ = load_deterministic_model(save_dir, device)
@@ -112,11 +178,11 @@ def load_mfvi_model(save_dir: str, temperature: float, replicate: int,
     
     # Load MFVI last layer
     mfvi_path = os.path.join(run_dir, "mfvi_layer.pt")
+    if not os.path.exists(mfvi_path):
+        raise FileNotFoundError(f"MFVI layer not found: {mfvi_path}\nRe-run training to save weights.")
+    
     mfvi_layer = BayesianLastLayerMFVI(512, 10).to(device)
-    
-    if os.path.exists(mfvi_path):
-        mfvi_layer.load_state_dict(torch.load(mfvi_path, map_location=device))
-    
+    mfvi_layer.load_state_dict(torch.load(mfvi_path, map_location=device))
     mfvi_layer.eval()
     print(f"Loaded MFVI model from {run_name}")
     
