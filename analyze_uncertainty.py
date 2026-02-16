@@ -191,6 +191,239 @@ def load_mfvi_model(save_dir: str, variant_name: str = None, temperature: float 
 
 
 # =============================================================================
+# Data Loading Helpers
+# =============================================================================
+
+def load_test_data(save_dir: str, n_samples: int = 100, device: str = None):
+    """
+    Load test data (CIFAR-10) and OOD data (SVHN) for analysis.
+    
+    Args:
+        save_dir: Directory containing data_split.json
+        n_samples: Number of samples to load from each dataset
+        device: Device to load tensors to
+    
+    Returns:
+        dict with keys:
+            - 'test_images': (n_samples, 3, 32, 32) tensor
+            - 'test_labels': (n_samples,) tensor
+            - 'ood_images': (n_samples, 3, 32, 32) tensor
+            - 'ood_labels': (n_samples,) tensor
+            - 'class_names': list of CIFAR-10 class names
+    
+    Example:
+        data = load_test_data("./results", n_samples=100)
+        print(data['test_images'].shape)  # (100, 3, 32, 32)
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    config = ExperimentConfig()
+    data_manager = DataLoaderManager(
+        config.data, config.ood, config.calibration,
+        flatten=False, save_dir=save_dir
+    )
+    
+    # Collect test samples
+    test_images, test_labels = [], []
+    for images, labels in data_manager.test_loader:
+        test_images.append(images)
+        test_labels.append(labels)
+        if sum(len(x) for x in test_images) >= n_samples:
+            break
+    test_images = torch.cat(test_images)[:n_samples].to(device)
+    test_labels = torch.cat(test_labels)[:n_samples].to(device)
+    
+    # Collect OOD samples
+    ood_images, ood_labels = [], []
+    for images, labels in data_manager.ood_loader:
+        ood_images.append(images)
+        ood_labels.append(labels)
+        if sum(len(x) for x in ood_images) >= n_samples:
+            break
+    ood_images = torch.cat(ood_images)[:n_samples].to(device)
+    ood_labels = torch.cat(ood_labels)[:n_samples].to(device)
+    
+    class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+                   'dog', 'frog', 'horse', 'ship', 'truck']
+    
+    print(f"Loaded {len(test_images)} test samples (CIFAR-10)")
+    print(f"Loaded {len(ood_images)} OOD samples (SVHN)")
+    
+    return {
+        'test_images': test_images,
+        'test_labels': test_labels,
+        'ood_images': ood_images,
+        'ood_labels': ood_labels,
+        'class_names': class_names
+    }
+
+
+def predict_svgd(feature_extractor: nn.Module, particles: List[nn.Module], 
+                 images: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """
+    Run SVGD ensemble prediction on images.
+    
+    Args:
+        feature_extractor: Pretrained ResNet feature extractor
+        particles: List of nn.Linear particles
+        images: (batch, 3, 32, 32) input images
+    
+    Returns:
+        dict with:
+            - 'mean_probs': (batch, 10) averaged predictions
+            - 'particle_probs': (n_particles, batch, 10) individual predictions
+            - 'predictions': (batch,) predicted classes
+            - 'confidence': (batch,) max probability
+            - 'total_entropy': (batch,) H[p̄(y|x)]
+            - 'aleatoric': (batch,) E[H[p(y|x,θ)]]
+            - 'epistemic': (batch,) total - aleatoric
+    
+    Example:
+        results = predict_svgd(fe, particles, data['test_images'][:10])
+        print(results['predictions'])  # predicted classes
+        print(results['epistemic'])    # epistemic uncertainty
+    """
+    device = next(feature_extractor.parameters()).device
+    images = images.to(device)
+    
+    with torch.no_grad():
+        features = feature_extractor(images)
+        
+        # Get predictions from each particle
+        particle_probs = []
+        for particle in particles:
+            logits = particle(features)
+            probs = F.softmax(logits, dim=-1)
+            particle_probs.append(probs)
+        
+        particle_probs = torch.stack(particle_probs)  # (n_particles, batch, 10)
+        mean_probs = particle_probs.mean(dim=0)       # (batch, 10)
+        
+        # Entropy decomposition
+        total_entropy = -torch.sum(mean_probs * torch.log(mean_probs + 1e-10), dim=-1)
+        individual_entropies = -torch.sum(particle_probs * torch.log(particle_probs + 1e-10), dim=-1)
+        aleatoric = individual_entropies.mean(dim=0)
+        epistemic = total_entropy - aleatoric
+    
+    return {
+        'mean_probs': mean_probs,
+        'particle_probs': particle_probs,
+        'predictions': mean_probs.argmax(dim=-1),
+        'confidence': mean_probs.max(dim=-1)[0],
+        'total_entropy': total_entropy,
+        'aleatoric': aleatoric,
+        'epistemic': epistemic
+    }
+
+
+def predict_mfvi(feature_extractor: nn.Module, mfvi_layer: nn.Module,
+                 images: torch.Tensor, n_samples: int = 50) -> Dict[str, torch.Tensor]:
+    """
+    Run MFVI prediction on images with multiple weight samples.
+    
+    Args:
+        feature_extractor: Pretrained ResNet feature extractor
+        mfvi_layer: BayesianLastLayerMFVI module
+        images: (batch, 3, 32, 32) input images
+        n_samples: Number of weight samples for Monte Carlo estimate
+    
+    Returns:
+        dict with same structure as predict_svgd
+    
+    Example:
+        results = predict_mfvi(fe, mfvi, data['test_images'][:10])
+        print(results['epistemic'])  # epistemic uncertainty
+    """
+    device = next(feature_extractor.parameters()).device
+    images = images.to(device)
+    
+    with torch.no_grad():
+        features = feature_extractor(images)
+        
+        # Sample from weight posterior multiple times
+        sample_probs = []
+        for _ in range(n_samples):
+            logits = mfvi_layer(features)
+            probs = F.softmax(logits, dim=-1)
+            sample_probs.append(probs)
+        
+        sample_probs = torch.stack(sample_probs)  # (n_samples, batch, 10)
+        mean_probs = sample_probs.mean(dim=0)     # (batch, 10)
+        
+        # Entropy decomposition
+        total_entropy = -torch.sum(mean_probs * torch.log(mean_probs + 1e-10), dim=-1)
+        individual_entropies = -torch.sum(sample_probs * torch.log(sample_probs + 1e-10), dim=-1)
+        aleatoric = individual_entropies.mean(dim=0)
+        epistemic = total_entropy - aleatoric
+    
+    return {
+        'mean_probs': mean_probs,
+        'sample_probs': sample_probs,
+        'predictions': mean_probs.argmax(dim=-1),
+        'confidence': mean_probs.max(dim=-1)[0],
+        'total_entropy': total_entropy,
+        'aleatoric': aleatoric,
+        'epistemic': epistemic
+    }
+
+
+def show_predictions(images: torch.Tensor, labels: torch.Tensor, 
+                     results: Dict[str, torch.Tensor], class_names: List[str],
+                     n_show: int = 5, title: str = "Predictions"):
+    """
+    Visualize predictions with uncertainty.
+    
+    Example:
+        show_predictions(
+            data['test_images'][:5], 
+            data['test_labels'][:5],
+            results, 
+            data['class_names']
+        )
+    """
+    n_show = min(n_show, len(images))
+    fig, axes = plt.subplots(2, n_show, figsize=(4*n_show, 8))
+    
+    # Denormalize for display
+    mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(3, 1, 1)
+    std = torch.tensor([0.2470, 0.2435, 0.2616]).view(3, 1, 1)
+    
+    for i in range(n_show):
+        # Image
+        img = images[i].cpu() * std + mean
+        img = img.permute(1, 2, 0).clamp(0, 1).numpy()
+        
+        ax = axes[0, i]
+        ax.imshow(img)
+        
+        pred = results['predictions'][i].item()
+        true = labels[i].item()
+        conf = results['confidence'][i].item()
+        epist = results['epistemic'][i].item()
+        
+        color = 'green' if pred == true else 'red'
+        ax.set_title(f"True: {class_names[true]}\nPred: {class_names[pred]}", 
+                    color=color, fontsize=10)
+        ax.axis('off')
+        
+        # Probability bar chart
+        ax = axes[1, i]
+        probs = results['mean_probs'][i].cpu().numpy()
+        colors = ['green' if j == true else ('red' if j == pred else 'steelblue') 
+                  for j in range(10)]
+        ax.barh(range(10), probs, color=colors)
+        ax.set_yticks(range(10))
+        ax.set_yticklabels(class_names, fontsize=8)
+        ax.set_xlim(0, 1)
+        ax.set_xlabel(f'Conf: {conf:.2f}, Epist: {epist:.3f}', fontsize=9)
+    
+    plt.suptitle(title, fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    return fig
+
+
+# =============================================================================
 # Uncertainty Computation
 # =============================================================================
 
