@@ -121,7 +121,8 @@ def load_svgd_particles(save_dir: str, variant_name: str = None, temperature: fl
     
     particles = []
     for i in range(n_particles):
-        particle = DeterministicLastLayer(512, 10).to(device)
+        # Particles are saved as nn.Linear (not DeterministicLastLayer)
+        particle = nn.Linear(512, 10).to(device)
         particle.load_state_dict(particles_state[i])
         particle.eval()
         particles.append(particle)
